@@ -142,32 +142,19 @@ impl Parser {
         let msg_block = BaseMessage::decode(&buf[3..])?;
         let method_name: Arc<str> = Arc::from(msg_block.method_name);
 
-        // Split method name into components (e.g. "lq.Lobby.oauth2Login")
-        let parts: Vec<&str> = method_name.split('.').collect();
-        ensure!(parts.len() >= 4, "Invalid method name format");
-
-        // Lookup method details in proto JSON
-        let proto_domain =
-            &self.proto_json["nested"][parts[1]]["nested"][parts[2]]["methods"][parts[3]];
+        let (req_type_name, res_type_name) = rpc_types(&self.proto_json, &method_name)?;
 
         // Decode request
-        let req_type_name = proto_domain["requestType"]
-            .as_str()
-            .context("Invalid request type")?;
         let req_type = self
             .pool
-            .get_message_by_name(&to_fqn(req_type_name))
+            .get_message_by_name(&descriptor_name(req_type_name))
             .context(format!("Invalid request type: {req_type_name}"))?;
         let dyn_msg = DynamicMessage::decode(req_type, msg_block.data.as_ref())?;
         let data_obj = dyn_to_json(&dyn_msg)?;
 
-        // Store response type for later
-        let res_type_name = proto_domain["responseType"]
-            .as_str()
-            .context("Invalid response type")?;
         let resp_type = self
             .pool
-            .get_message_by_name(&to_fqn(res_type_name))
+            .get_message_by_name(&descriptor_name(res_type_name))
             .context(format!("Invalid response type: {res_type_name}"))?;
         self.respond_type
             .insert(msg_id, (method_name.clone(), resp_type));
@@ -210,6 +197,31 @@ fn to_fqn(method_name: &str) -> String {
     format!("lq.{method_name}")
 }
 
+fn descriptor_name(name: &str) -> String {
+    if name.starts_with('.') {
+        name.trim_start_matches('.').to_string()
+    } else {
+        to_fqn(name)
+    }
+}
+
+fn rpc_types<'a>(proto_json: &'a JsonValue, method_name: &str) -> Result<(&'a str, &'a str)> {
+    if let Some(entry) = proto_json.get(method_name) {
+        let req = entry["req"].as_str().context("Invalid request type")?;
+        let resp = entry["resp"].as_str().context("Invalid response type")?;
+        return Ok((req, resp));
+    }
+
+    // Accept the legacy protobufjs JSON while users transition to the new release format.
+    let parts: Vec<&str> = method_name.split('.').collect();
+    ensure!(parts.len() >= 4, "Invalid method name format");
+    let domain = &proto_json["nested"][parts[1]]["nested"][parts[2]]["methods"][parts[3]];
+    Ok((
+        domain["requestType"].as_str().context("Invalid request type")?,
+        domain["responseType"].as_str().context("Invalid response type")?,
+    ))
+}
+
 pub fn decode_action(name: &str, data: &str, pool: &DescriptorPool) -> Result<JsonValue> {
     let mut decoded = BASE64_STANDARD.decode(data)?;
     wtf_decode(&mut decoded);
@@ -228,4 +240,24 @@ fn wtf_decode(data: &mut [u8]) {
         .zip(data.iter_mut())
         .enumerate()
         .for_each(|(i, (key, b))| *b ^= (base + 5 * i + *key as usize) as u8);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_flat_rpc_mapping() {
+        let mapping = serde_json::json!({
+            ".lq.Lobby.login": {
+                "req": ".lq.ReqLogin",
+                "resp": ".lq.ResLogin"
+            }
+        });
+
+        assert_eq!(
+            rpc_types(&mapping, ".lq.Lobby.login").unwrap(),
+            (".lq.ReqLogin", ".lq.ResLogin")
+        );
+    }
 }

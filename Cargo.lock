@@ -1043,6 +1043,7 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-reflect",
+ "prost-types",
  "rand",
  "reqwest",
  "serde",

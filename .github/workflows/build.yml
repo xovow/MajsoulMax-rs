@@ -46,7 +46,9 @@ jobs:
           - os: android
             runner: ubuntu-latest
           - os: windows
-            runner: windows-latest
+            # aws-lc-sys 0.32.x does not support the VS 18/MSVC 14.51
+            # toolchain currently selected by windows-latest.
+            runner: windows-2022
           - os: macos
             runner: macos-latest
           # musl packages
@@ -76,11 +78,6 @@ jobs:
         run: |
           echo "triple=${{ matrix.target_arch }}-${{matrix.target_vendor_sys_env}}" >> $GITHUB_OUTPUT
           rustup target add ${{ matrix.target_arch }}-${{matrix.target_vendor_sys_env}} && rustup update
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: nttld/setup-ndk@v1.5.0
         if: ${{ matrix.os == 'android' }}

@@ -26,7 +26,6 @@ async fn main() -> Result<()> {
 
     let settings = Box::new(Settings::new(std::path::Path::new("./liqi_config"))?);
     let settings: &'static Settings = Box::leak(settings);
-    let mod_settings = RwLock::new(ModSettings::new(settings)?);
 
     // show mod and helper switch status, green for on, red for off
     println!(
@@ -54,20 +53,11 @@ async fn main() -> Result<()> {
     let modder = if settings.mod_on() {
         // start mod worker
         info!("Mod worker started");
-        if mod_settings.read().await.auto_update() {
-            info!("自动更新mod已开启");
-            let mut new_mod_settings = mod_settings.read().await.clone();
-            match new_mod_settings.get_lqc().await {
-                Err(e) => warn!("更新mod失败: {e}"),
-                Ok(true) => {
-                    info!("mod更新成功, 请重启程序");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    return Ok(());
-                }
-                Ok(false) => (),
-            }
-        }
-        Some(Modder::new(mod_settings).await?)
+        // Load after the update check so a legacy installation can fetch the
+        // new resource index before the mod starts.
+        let max_data = MaxData::load(settings.data_dir())?;
+        let mod_settings = RwLock::new(ModSettings::new(settings)?);
+        Some(Modder::new(mod_settings, max_data).await?)
     } else {
         None
     };

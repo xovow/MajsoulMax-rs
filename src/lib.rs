@@ -14,7 +14,7 @@ mod settings;
 
 pub use crate::{
     modder::Modder,
-    settings::{ModSettings, Settings},
+    settings::{MaxData, ModSettings, Settings},
 };
 pub use anyhow::Result;
 pub use tokio::sync::RwLock;
