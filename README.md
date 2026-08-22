@@ -294,14 +294,10 @@ function main(config) {
 
 ## 🤔 Q&A
 
-1. 为什么要自动更新 liqi 和 lqc.lqbin？更新失败有什么影响？
-    - liqi：
-        - 共有 3 个文件，包括 `liqi.json` 和根据其生成的 `liqi.proto` 和 `liqi.desc`，用于解析雀魂 protobuf 消息
-        - 如果更新失败，可能会导致消息无法解析（如新活动的消息）
-    - lqc.lqbin：
-        - 用于获取全部角色、装扮、物品等游戏资源
-        - 如果更新失败，可能会导致无法获取新资源（如新角色、物品等）
-    - 如果自动更新失败，可以在 [AutoLiqi > Releases](https://github.com/Xerxes-2/AutoLiqi/releases/latest) 下载，并手动替换 `./liqi_config` 文件夹下的同名文件
+1. 为什么要自动更新协议和资源数据？更新失败有什么影响？
+    - `liqi.desc` 描述雀魂 protobuf 消息，程序会根据它生成 RPC 映射 `liqi.json`。更新失败时，新消息可能无法解析。
+    - `max_data.yaml` 包含角色、皮肤、称号、物品、加载图、表情和传记 ID。更新失败时，新资源不会出现在解锁列表中。
+    - 如果自动更新失败，可以运行 `python tools/update_proto.py --token <GitHub Token>`；脚本会从 [MajsoulData > Releases](https://github.com/Avenshy/MajsoulData/releases/latest) 更新全部三个文件。
 2. 如何同时启用自己的代理（机场 / VPN）？
     - 推荐使用支持规则和覆写的代理软件（如 `Clash` / `Surge`），将雀魂相关流量首先分流到本地 `MajsoulMax-rs` 节点，再由该节点转发到你原有的代理节点。
     - 具体示例配置见上文 “代理与分流” 一节，你也可以将示例写成单独的覆写配置文件，在需要时再启用。
@@ -311,7 +307,6 @@ function main(config) {
 ## 🛠️ 开发依赖
 
 -   [Rust](https://www.rust-lang.org/) >= 1.85
--   [Protoc](https://github.com/protocolbuffers/protobuf)
 
 ## 📜 许可证
 

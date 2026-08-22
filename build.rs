@@ -1,18 +1,28 @@
-use std::{env, io::Result, path::PathBuf};
+use std::{fs, io::Result};
+
+use prost::Message;
+use prost_types::FileDescriptorSet;
 
 fn main() -> Result<()> {
-    prost_build::Config::new()
+    println!("cargo:rerun-if-changed=liqi_config/liqi.desc");
+
+    let descriptor_bytes = fs::read("liqi_config/liqi.desc")?;
+    let mut descriptor_set = FileDescriptorSet::decode(descriptor_bytes.as_slice())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    // The modder only uses lq protocol types. The other packages describe
+    // legacy resource tables that max_data.yaml replaces.
+    descriptor_set
+        .file
+        .retain(|file| file.package.as_deref() == Some("lq"));
+
+    let mut config = prost_build::Config::new();
+    config
         .type_attribute(".", "#[allow(dead_code)]")
         .type_attribute(
             "lq.ViewSlot",
             "#[derive(::serde::Serialize, ::serde::Deserialize)]",
-        )
-        .file_descriptor_set_path(
-            PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR environment variable not set"))
-                .join("liqi_desc.bin"),
-        )
-        .out_dir("src/proto")
-        .compile_protos(&["proto/liqi.proto", "proto/sheets.proto"], &["proto/"])?;
+        );
+    config.out_dir("src/proto").compile_fds(descriptor_set)?;
 
     Ok(())
 }

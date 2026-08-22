@@ -1,15 +1,15 @@
 use crate::{
-    proto::{base::BaseMessage, lq, lq_config::ConfigTables, sheets},
-    settings::ModSettings,
+    proto::{base::BaseMessage, lq},
+    settings::{MaxData, ModSettings},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use const_format::formatcp;
 use prost::Message;
 use rand::{rng, seq::IndexedRandom};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ANNOUNCEMENT: &str = formatcp!(
@@ -36,34 +36,10 @@ pub struct Safe {
 
 #[derive(Default)]
 pub struct Modder {
-    characters: Vec<sheets::ItemDefinitionCharacter>,
-    skins: Vec<sheets::ItemDefinitionSkin>,
-    titles: Vec<sheets::ItemDefinitionTitle>,
-    items: Vec<sheets::ItemDefinitionItem>,
-    loading_images: Vec<sheets::ItemDefinitionLoadingImage>,
-    emojis: HashMap<u32, Vec<u32>>,
-    endings: Vec<sheets::SpotRewards>,
+    max_data: MaxData,
     mod_settings: RwLock<ModSettings>,
     safe: RwLock<Safe>,
     contract: RwLock<String>,
-}
-
-pub fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-    }
-}
-
-fn to_vec<T: Message + std::default::Default>(buf: &[Vec<u8>]) -> Vec<T> {
-    buf.iter()
-        .filter_map(|d| {
-            T::decode(d.as_ref())
-                .inspect_err(|_| warn!("Failed to decode {}", std::any::type_name::<T>()))
-                .ok()
-        })
-        .collect()
 }
 
 pub struct ModifyResult {
@@ -72,55 +48,12 @@ pub struct ModifyResult {
 }
 
 impl Modder {
-    pub async fn new(mod_settings: RwLock<ModSettings>) -> Result<Self> {
-        let config_tables = ConfigTables::decode(mod_settings.read().await.resource.as_ref())
-            .context("Failed to decode config tables")?;
-        let mut modder = Modder {
+    pub async fn new(mod_settings: RwLock<ModSettings>, max_data: MaxData) -> Result<Self> {
+        let modder = Modder {
+            max_data,
             mod_settings,
             ..Default::default()
         };
-        for data in config_tables.datas {
-            // get '_' splitted words in data.table and data.sheet, turn into CamelCase then join by ""
-            let class_name = data
-                .table
-                .split('_')
-                .chain(data.sheet.split('_'))
-                .map(capitalize)
-                .collect::<String>();
-            match class_name.as_str() {
-                "ItemDefinitionCharacter" => {
-                    modder.characters = to_vec(data.data.as_ref());
-                }
-                "ItemDefinitionSkin" => {
-                    modder.skins = to_vec(data.data.as_ref());
-                }
-                "ItemDefinitionTitle" => {
-                    modder.titles = to_vec(data.data.as_ref());
-                }
-                "ItemDefinitionItem" => {
-                    modder.items = to_vec(data.data.as_ref());
-                }
-                "ItemDefinitionLoadingImage" => {
-                    modder.loading_images = to_vec(data.data.as_ref());
-                }
-                "CharacterEmoji" => {
-                    // one character can have multiple emojis
-                    for d in data.data {
-                        let emoji = sheets::CharacterEmoji::decode(d.as_ref())
-                            .context("Failed to decode CharacterEmoji")?;
-                        modder
-                            .emojis
-                            .entry(emoji.charid)
-                            .or_default()
-                            .push(emoji.sub_id);
-                    }
-                }
-                "SpotRewards" => {
-                    modder.endings = to_vec(data.data.as_ref());
-                }
-                _ => {}
-            }
-        }
         Ok(modder)
     }
 
@@ -186,13 +119,12 @@ impl Modder {
                 msg.characters
                     .clone_into(&mut self.safe.write().await.characters);
                 msg.characters.clear();
-                let characters = &self.mod_settings.read().await.char_skin;
-                for char in characters.keys() {
-                    let character = self.perfect_character(*char).await?;
+                for charid in self.max_data.character.iter().copied() {
+                    let character = self.perfect_character(charid).await?;
                     msg.characters.push(character);
                 }
                 msg.skins.clear();
-                msg.skins.extend(self.skins.iter().map(|s| s.id));
+                msg.skins.extend(self.max_data.skin.iter().copied());
                 msg.main_character_id = self.mod_settings.read().await.main_char;
                 msg.character_sort.clear();
                 msg.character_sort
@@ -209,9 +141,9 @@ impl Modder {
                 msg.finished_endings.clear();
                 msg.rewarded_endings.clear();
                 msg.finished_endings
-                    .extend(self.endings.iter().map(|e| e.id));
+                    .extend(self.max_data.endings.iter().copied());
                 msg.rewarded_endings
-                    .extend(self.endings.iter().map(|e| e.id));
+                    .extend(self.max_data.endings.iter().copied());
                 modified_data = Some(msg.encode_to_vec());
             }
             name if name == ".lq.Lobby.login" || name == ".lq.Lobby.oauth2Login" => {
@@ -296,7 +228,7 @@ impl Modder {
             ".lq.Lobby.fetchTitleList" => {
                 let mut msg = lq::ResTitleList::decode(msg_block.data.as_ref())?;
                 msg.title_list.clear();
-                msg.title_list.extend(self.titles.iter().map(|t| t.id));
+                msg.title_list.extend(self.max_data.title.iter().copied());
                 modified_data = Some(msg.encode_to_vec());
             }
             ".lq.Lobby.fetchRoom" => {
@@ -359,12 +291,12 @@ impl Modder {
                         .characters
                         .clone_into(&mut self.safe.write().await.characters);
                     char_info.characters.clear();
-                    for charid in self.characters.iter().map(|c| c.id) {
+                    for charid in self.max_data.character.iter().copied() {
                         let character = self.perfect_character(charid).await?;
                         char_info.characters.push(character);
                     }
                     char_info.skins.clear();
-                    char_info.skins.extend(self.skins.iter().map(|s| s.id));
+                    char_info.skins.extend(self.max_data.skin.iter().copied());
                     char_info.main_character_id = self.mod_settings.read().await.main_char;
                     char_info.character_sort.clear();
                     char_info
@@ -383,10 +315,10 @@ impl Modder {
                     char_info.rewarded_endings.clear();
                     char_info
                         .finished_endings
-                        .extend(self.endings.iter().map(|e| e.id));
+                        .extend(self.max_data.endings.iter().copied());
                     char_info
                         .rewarded_endings
-                        .extend(self.endings.iter().map(|e| e.id));
+                        .extend(self.max_data.endings.iter().copied());
                 }
                 if let Some(ref mut bag_info) = msg.bag_info
                     && let Some(ref mut bag) = bag_info.bag {
@@ -414,7 +346,7 @@ impl Modder {
                     }
                 }
                 msg.title_list = Some(lq::ResTitleList {
-                    title_list: self.titles.iter().map(|t| t.id).collect(),
+                    title_list: self.max_data.title.clone(),
                     ..Default::default()
                 });
                 msg.random_character = Some(lq::ResRandomCharacter {
@@ -518,25 +450,22 @@ impl Modder {
         bag.items.extend(self.safe.read().await.items.iter().cloned());
         let mut seen = bag.items.iter().map(|item| item.item_id).collect::<HashSet<_>>();
 
-        for item in self.items.iter() {
-            if matches!(item.category, 1 | 2) {
-                continue;
-            }
-            if !seen.insert(item.id) {
+        for item_id in self.max_data.item.iter().copied() {
+            if !seen.insert(item_id) {
                 continue;
             }
             let new_item = lq::Item {
-                item_id: item.id,
+                item_id,
                 stack: 1,
             };
             bag.items.push(new_item);
         }
-        for item in self.loading_images.iter() {
-            if !seen.insert(item.id) {
+        for item_id in self.max_data.loading_image.iter().copied() {
+            if !seen.insert(item_id) {
                 continue;
             }
             let new_item = lq::Item {
-                item_id: item.id,
+                item_id,
                 stack: 1,
             };
             bag.items.push(new_item);
@@ -619,9 +548,9 @@ impl Modder {
             //int('40'+str(c)[4:]+'01')
             .or_insert(char_id);
         if self.mod_settings.read().await.emoji_on() {
-            character
-                .extra_emoji
-                .extend(self.emojis.get(&id).unwrap_or(&vec![]))
+            if let Some(emojis) = self.max_data.emoji.get(&id) {
+                character.extra_emoji.extend(emojis);
+            }
         }
         character.views.clear();
         character.views.extend(

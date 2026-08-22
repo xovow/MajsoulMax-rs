@@ -38,4 +38,6 @@ rand = { version = "0.9", features = ["thread_rng"], default-features = false }
 url = { version = "2", features = ["serde"], default-features = false }
 
 [build-dependencies]
+prost = { version = "0.14", default-features = false }
 prost-build = { version = "0.14", default-features = false }
+prost-types = "0.14"

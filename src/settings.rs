@@ -1,6 +1,5 @@
 use crate::proto::lq::ViewSlot;
-use anyhow::{Context, Result, bail};
-use bytes::Bytes;
+use anyhow::{Context, Result, bail, ensure};
 use prost::Message;
 use prost_reflect::{DescriptorPool, prost_types::FileDescriptorSet};
 use serde::{Deserialize, Serialize};
@@ -8,10 +7,118 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::LazyLock,
 };
 use tokio::spawn;
 use tracing::{error, info};
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct MaxData {
+    pub character: Vec<u32>,
+    pub skin: Vec<u32>,
+    pub title: Vec<u32>,
+    pub item: Vec<u32>,
+    pub loading_image: Vec<u32>,
+    pub emoji: HashMap<u32, Vec<u32>>,
+    pub endings: Vec<u32>,
+}
+
+impl MaxData {
+    pub fn load(dir: &Path) -> Result<Self> {
+        let content = std::fs::read_to_string(dir.join("max_data.yaml"))
+            .context("无法读取max_data.yaml")?;
+        parse_max_data(&content)
+    }
+}
+
+fn parse_max_data(content: &str) -> Result<MaxData> {
+    let mut result = MaxData::default();
+    let mut section = String::new();
+    let mut emoji_character = None;
+
+    for (line_number, raw_line) in content.lines().enumerate() {
+        let line = raw_line.trim_end_matches('\r');
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !line.starts_with(' ') && !trimmed.starts_with("- ") {
+            ensure!(
+                trimmed.ends_with(':'),
+                "invalid max_data.yaml line {}",
+                line_number + 1
+            );
+            section = trimmed.trim_end_matches(':').to_string();
+            emoji_character = None;
+            ensure!(
+                matches!(
+                    section.as_str(),
+                    "character"
+                        | "skin"
+                        | "title"
+                        | "item"
+                        | "loading_image"
+                        | "emoji"
+                        | "endings"
+                ),
+                "unknown max_data.yaml section on line {}",
+                line_number + 1
+            );
+            continue;
+        }
+
+        if section == "emoji" && line.starts_with("  ") && trimmed.ends_with(':') {
+            let id = trimmed
+                .trim_end_matches(':')
+                .parse::<u32>()
+                .with_context(|| format!("invalid emoji character on line {}", line_number + 1))?;
+            result.emoji.entry(id).or_default();
+            emoji_character = Some(id);
+            continue;
+        }
+
+        ensure!(
+            trimmed.starts_with("- "),
+            "invalid max_data.yaml line {}",
+            line_number + 1
+        );
+        let id = trimmed[2..]
+            .parse::<u32>()
+            .with_context(|| format!("invalid data ID on line {}", line_number + 1))?;
+        match section.as_str() {
+            "character" => result.character.push(id),
+            "skin" => result.skin.push(id),
+            "title" => result.title.push(id),
+            "item" => result.item.push(id),
+            "loading_image" => result.loading_image.push(id),
+            "endings" => result.endings.push(id),
+            "emoji" => result
+                .emoji
+                .get_mut(&emoji_character.context("emoji item without character")?)
+                .expect("emoji character was inserted above")
+                .push(id),
+            _ => bail!(
+                "list item outside a max_data.yaml section on line {}",
+                line_number + 1
+            ),
+        }
+    }
+
+    ensure!(!result.character.is_empty(), "max_data.yaml has no characters");
+    ensure!(!result.skin.is_empty(), "max_data.yaml has no skins");
+    ensure!(!result.title.is_empty(), "max_data.yaml has no titles");
+    ensure!(!result.item.is_empty(), "max_data.yaml has no items");
+    ensure!(
+        !result.loading_image.is_empty(),
+        "max_data.yaml has no loading images"
+    );
+    ensure!(!result.emoji.is_empty(), "max_data.yaml has no emoji data");
+    ensure!(
+        result.emoji.values().all(|items| !items.is_empty()),
+        "max_data.yaml has an empty emoji list"
+    );
+    ensure!(!result.endings.is_empty(), "max_data.yaml has no endings");
+    Ok(result)
+}
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -40,23 +147,13 @@ pub struct Settings {
 }
 
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
-static REQUEST_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .user_agent(APP_USER_AGENT)
-        .build()
-        .expect("An error occured in building request client.")
-});
 
 impl Settings {
     fn create_github_client(&self) -> Result<reqwest::Client> {
         let mut builder = reqwest::Client::builder().user_agent(APP_USER_AGENT);
-
-        if let Some(req_proxy) = &self.req_proxy {
-            let proxy = reqwest::Proxy::all(req_proxy.clone())
-                .context("Failed to create proxy from req_proxy")?;
-            builder = builder.proxy(proxy);
+        if let Some(proxy) = &self.req_proxy {
+            builder = builder.proxy(reqwest::Proxy::all(proxy.clone())?);
         }
-
         builder.build().context("Failed to build HTTP client")
     }
 
@@ -65,197 +162,204 @@ impl Settings {
         let dir = if arg_dir.is_dir() {
             arg_dir.to_path_buf()
         } else {
-            // current executable path
             exe.parent()
-                .context("无法获取当前可执行文件路径的父目录")?
+                .context("无法获取可执行文件的父目录")?
                 .join("liqi_config")
         };
-        let settings =
-            std::fs::read_to_string(dir.join("settings.json")).context("无法读取settings.json")?;
+        let content = std::fs::read_to_string(dir.join("settings.json"))
+            .context("无法读取settings.json")?;
         let mut settings: Settings =
-            serde_json::from_str(&settings).context("无法解析settings.json")?;
-        info!("已载入配置");
+            serde_json::from_str(&content).context("无法解析settings.json")?;
         settings.methods_set = settings.send_method.iter().cloned().collect();
         settings.actions_set = settings.send_action.iter().cloned().collect();
 
-        // read desc from file
-        let file_descriptor_set_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/liqi_desc.bin"));
-        let file_descriptor_set =
-            FileDescriptorSet::decode(&file_descriptor_set_bytes[..]).unwrap();
-        settings.desc = DescriptorPool::from_file_descriptor_set(file_descriptor_set)
+        let descriptor_bytes =
+            std::fs::read(dir.join("liqi.desc")).context("无法读取liqi.desc")?;
+        let descriptor_set = FileDescriptorSet::decode(descriptor_bytes.as_slice())
             .context("无法解析liqi.desc")?;
-
-        // read liqi.json from file
+        settings.desc = DescriptorPool::from_file_descriptor_set(descriptor_set)
+            .context("无法构建liqi descriptor pool")?;
         settings.proto_json = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("liqi.json")).context("无法读取liqi.json")?,
+            &std::fs::read_to_string(dir.join("liqi.json"))
+                .context("无法读取liqi.json")?,
         )
         .context("无法解析liqi.json")?;
         settings.dir = dir;
         Ok(settings)
     }
 
+    pub fn data_dir(&self) -> &Path {
+        &self.dir
+    }
     pub fn is_method(&self, method: &str) -> bool {
         self.methods_set.contains(method)
     }
-
     pub fn is_action(&self, action: &str) -> bool {
         self.actions_set.contains(action)
     }
-
     pub fn helper_on(&self) -> bool {
         self.helper_switch
     }
-
     pub fn mod_on(&self) -> bool {
         self.mod_switch
     }
-
     pub fn auto_update(&self) -> bool {
         self.auto_update
     }
 
     pub async fn update(&mut self) -> Result<bool> {
-        let version = get_version().await?;
-        let prefix = get_proto_prefix(&version).await?;
-        if self.liqi_version == prefix {
-            info!("无需更新liqi, 当前版本: {version}");
-            return Ok(false);
+        let client = self.create_github_client()?;
+        let mut request = client
+            .get("https://api.github.com/repos/Avenshy/MajsoulData/releases/latest")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .timeout(std::time::Duration::from_secs(10));
+        if !self.github_token.is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", self.github_token));
         }
-        info!(
-            "liqi需要更新, 当前版本: {}, 最新版本: {prefix}",
-            self.liqi_version
-        );
-
-        let resp = if self.github_token.is_empty() {
-            let client = self.create_github_client()?;
-            client
-                .get("https://api.github.com/repos/Xerxes-2/AutoLiqi/releases/latest")
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await
-                .context("Failed to get latest release")?
-        } else {
-            let client = self.create_github_client()?;
-            client
-                .get("https://api.github.com/repos/Xerxes-2/AutoLiqi/releases/latest")
-                .header("Authorization", format!("Bearer {}", self.github_token))
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await
-                .context("Failed to get latest release")?
-        };
-        if resp
+        let response = request
+            .send()
+            .await
+            .context("Failed to get MajsoulData latest release")?
+            .error_for_status()
+            .context("MajsoulData latest release request failed")?;
+        if response
             .headers()
             .get("X-RateLimit-Remaining")
-            .context("GitHub API rate limit header not found")?
-            == "0"
+            .and_then(|value| value.to_str().ok()) == Some("0")
         {
             bail!("GitHub API rate limit exceeded");
         }
-        let json: Value = resp.json().await?;
-        if json["tag_name"] == self.liqi_version {
-            info!("liqi需要更新, 但是AutoLiqi尚未更新, 稍晚再试");
+        let release: Value = response.json().await?;
+        let version = release["tag_name"]
+            .as_str()
+            .context("MajsoulData release has no tag_name")?;
+        if self.liqi_version == version {
+            info!("无需更新协议和资源数据, 当前版本: {version}");
             return Ok(false);
         }
-        let assets = json["assets"]
+
+        let assets = release["assets"]
             .as_array()
-            .context("No assets found in latest release")?;
-        for asset_item in assets {
-            self.download_asset(asset_item).await?;
+            .context("MajsoulData release has no assets")?;
+        let mut descriptor = None;
+        let mut max_data = None;
+        for asset in assets {
+            match asset["name"].as_str().unwrap_or_default() {
+                "liqi.desc" => descriptor = Some(self.download_asset(asset).await?),
+                "max_data.yaml" => max_data = Some(self.download_asset(asset).await?),
+                _ => {}
+            }
         }
-        // write settings.json
-        self.liqi_version = prefix;
-        let dir = self.dir.join("settings.json");
-        std::fs::write(dir, serde_json::to_string_pretty(self)?)?;
+        let descriptor = descriptor.context("MajsoulData release lacks liqi.desc")?;
+        let max_data = max_data.context("MajsoulData release lacks max_data.yaml")?;
+        let rpc_map = generate_liqi_json(&descriptor)?;
+        parse_max_data(
+            std::str::from_utf8(&max_data).context("max_data.yaml is not valid UTF-8")?,
+        )?;
+
+        // Write all related files only after every required asset has downloaded successfully.
+        std::fs::write(self.dir.join("liqi.desc"), descriptor)?;
+        std::fs::write(self.dir.join("max_data.yaml"), max_data)?;
+        std::fs::write(self.dir.join("liqi.json"), rpc_map)?;
+        self.liqi_version = version.to_string();
+        std::fs::write(
+            self.dir.join("settings.json"),
+            serde_json::to_string_pretty(self)?,
+        )?;
+        info!("协议和资源数据更新完成: {version}");
         Ok(true)
     }
 
-    pub async fn download_asset(&self, asset_item: &Value) -> Result<()> {
-        const ASSET_NAMES: [&str; 2] = ["liqi.desc", "liqi.json"];
-        let name = asset_item["name"]
-            .as_str()
-            .context("No name found in asset")?;
-        if !ASSET_NAMES.contains(&name) {
-            return Ok(());
+    async fn download_asset(&self, asset: &Value) -> Result<Vec<u8>> {
+        let name = asset["name"].as_str().context("No asset name")?;
+        ensure!(
+            matches!(name, "liqi.desc" | "max_data.yaml"),
+            "Unsupported asset: {name}"
+        );
+        let url = asset["browser_download_url"].as_str().context("No asset URL")?;
+        let client = self.create_github_client()?;
+        let mut request = client
+            .get(url)
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .timeout(std::time::Duration::from_secs(10));
+        if !self.github_token.is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", self.github_token));
         }
-        let url = asset_item["browser_download_url"]
-            .as_str()
-            .context("No download url found in asset")?;
-        let resp = if self.github_token.is_empty() {
-            let client = self.create_github_client()?;
-            client
-                .get(url)
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await
-                .context("Failed to download asset")?
-        } else {
-            let client = self.create_github_client()?;
-            client
-                .get(url)
-                .header("Authorization", format!("Bearer {}", self.github_token))
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await
-                .context("Failed to download asset")?
-        };
-
-        let resp = resp
+        let response = request
+            .send()
+            .await
+            .context("Failed to download asset")?
             .error_for_status()
-            .context("Failed to download asset")?;
-
-        let bytes = resp.bytes().await?;
-        let file_dir = self.dir.join(name);
-        std::fs::write(file_dir, bytes)?;
-        info!("下载完成: {name}");
-        Ok(())
+            .context("Asset download failed")?;
+        Ok(response.bytes().await?.to_vec())
     }
 }
 
-async fn get_version() -> Result<String> {
-    let resp = REQUEST_CLIENT
-        .get("https://game.maj-soul.com/1/version.json")
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .context("Failed to get version")?;
-    let json: Value = resp.json().await?;
-    let version = json["version"].as_str().context("No version found")?;
-    Ok(version.to_string())
+fn generate_liqi_json(bytes: &[u8]) -> Result<String> {
+    let descriptors = FileDescriptorSet::decode(bytes).context("无法解析liqi.desc")?;
+    let mut rpc_map = serde_json::Map::new();
+    for file in descriptors.file {
+        let package = file.package.unwrap_or_default();
+        for service in file.service {
+            let service_name = service.name.context("service without name in liqi.desc")?;
+            for method in service.method {
+                let method_name = method.name.context("method without name in liqi.desc")?;
+                let input_type = method
+                    .input_type
+                    .context("method without input type in liqi.desc")?;
+                let output_type = method
+                    .output_type
+                    .context("method without output type in liqi.desc")?;
+                let full_method = format!(".{package}.{service_name}.{method_name}");
+                rpc_map.insert(
+                    full_method,
+                    serde_json::json!({"req": input_type, "resp": output_type}),
+                );
+            }
+        }
+    }
+    Ok(serde_json::to_string(&Value::Object(rpc_map))?)
 }
 
-async fn get_proto_prefix(version: &str) -> Result<String> {
-    let resp = REQUEST_CLIENT
-        .get(format!(
-            "https://game.maj-soul.com/1/resversion{version}.json",
-        ))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .context("Failed to get prefix")?;
-    let json: Value = resp.json().await?;
-    let prefix = json["res"]["res/proto/liqi.json"]["prefix"]
-        .as_str()
-        .context("No prefix found")?;
-    Ok(prefix.to_string())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub async fn get_lqbin_prefix(version: &str) -> Result<String> {
-    let resp = REQUEST_CLIENT
-        .get(format!(
-            "https://game.maj-soul.com/1/resversion{version}.json"
-        ))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .context("Failed to get prefix")?;
-    let json: Value = resp.json().await?;
-    let prefix = json["res"]["res/config/lqc.lqbin"]["prefix"]
-        .as_str()
-        .context("No prefix found")?;
-    Ok(prefix.to_string())
+    #[test]
+    fn parses_bundled_max_data() {
+        let data = parse_max_data(include_str!("../liqi_config/max_data.yaml")).unwrap();
+
+        assert!(!data.character.is_empty());
+        assert!(!data.skin.is_empty());
+        assert!(!data.title.is_empty());
+        assert!(!data.item.is_empty());
+        assert!(!data.loading_image.is_empty());
+        assert!(!data.endings.is_empty());
+        assert!(data.emoji.values().all(|items| !items.is_empty()));
+    }
+
+    #[test]
+    fn rejects_malformed_list_items_without_panicking() {
+        // Regression: malformed list-item lines must return an error, never panic.
+        for content in [
+            "character:\n- \n",
+            "character:\n- abc\n",
+            "character:\n-\n",
+            "character:\n-\n- 200001\n",
+        ] {
+            assert!(parse_max_data(content).is_err(), "content: {content:?}");
+        }
+    }
+
+    #[test]
+    fn generates_rpc_map_from_bundled_descriptor() {
+        let json = generate_liqi_json(include_bytes!("../liqi_config/liqi.desc")).unwrap();
+        let map: Value = serde_json::from_str(&json).unwrap();
+        let auth_game = &map[".lq.FastTest.authGame"];
+
+        assert_eq!(auth_game["req"], ".lq.ReqAuthGame");
+        assert_eq!(auth_game["resp"], ".lq.ResAuthGame");
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -274,22 +378,19 @@ pub struct ModSettings {
     pub preset_index: u32,
     show_server: bool,
     anti_nickname_censorship: bool,
-    auto_update: bool,
     version: String,
     pub random_char_switch: bool,
     pub random_char_pool: Vec<(u32, u32)>,
     pub verified: u32,
-    #[serde(skip)]
-    pub resource: Bytes,
     #[serde(skip)]
     dir: PathBuf,
 }
 
 impl Default for ModSettings {
     fn default() -> Self {
-        ModSettings {
+        Self {
             main_char: 200001,
-            char_skin: HashMap::new(),
+            char_skin: Default::default(),
             nickname: String::new(),
             star_character: Vec::new(),
             hidden_characters: Vec::new(),
@@ -301,12 +402,10 @@ impl Default for ModSettings {
             preset_index: 0,
             show_server: true,
             anti_nickname_censorship: true,
-            auto_update: true,
-            verified: 0,
+            version: String::new(),
             random_char_switch: false,
             random_char_pool: Vec::new(),
-            version: String::new(),
-            resource: Bytes::new(),
+            verified: 0,
             dir: PathBuf::new(),
         }
     }
@@ -314,94 +413,41 @@ impl Default for ModSettings {
 
 impl ModSettings {
     pub fn new(general_settings: &Settings) -> Result<Self> {
-        // read settings.mod.json, if not exist, create a new one
-        let dir = general_settings.dir.join("settings.mod.json");
-        // read res from lqc.lqbin
-        let res =
-            std::fs::read(general_settings.dir.join("lqc.lqbin")).context("无法读取lqc.lqbin")?;
-        let settings = std::fs::read_to_string(dir);
-        let settings = match settings {
-            Ok(settings) => settings,
+        let dir = general_settings.data_dir().join("settings.mod.json");
+        let mut settings: Self = match std::fs::read_to_string(&dir) {
+            Ok(content) => serde_json::from_str(&content).context("无法解析settings.mod.json")?,
             Err(_) => {
-                let default = ModSettings {
-                    dir: general_settings.dir.clone(),
-                    resource: Bytes::from(res),
-                    ..Default::default()
-                };
+                let mut default = Self::default();
+                default.dir = general_settings.data_dir().to_path_buf();
                 default.write();
                 return Ok(default);
             }
         };
-        let mut settings: ModSettings =
-            serde_json::from_str(&settings).context("无法解析settings.mod.json")?;
-        info!("已载入Mod配置");
-        settings.resource = Bytes::from(res);
-        settings.dir = general_settings.dir.clone();
+        settings.dir = general_settings.data_dir().to_path_buf();
         Ok(settings)
     }
 
     pub fn hint_on(&self) -> bool {
         self.hint_switch
     }
-
     pub fn emoji_on(&self) -> bool {
         self.emoji_switch
     }
-
     pub fn show_server(&self) -> bool {
         self.show_server
     }
-
-    pub fn auto_update(&self) -> bool {
-        self.auto_update
-    }
-
     pub fn anti_nickname_censorship(&self) -> bool {
         self.anti_nickname_censorship
     }
 
-    pub async fn get_lqc(&mut self) -> Result<bool> {
-        // get lqc.lqbin prefix from https://game.maj-soul.com/1/{prefix}/res/config/lqc.lqbin
-        let version = get_version().await?;
-        let prefix = get_lqbin_prefix(&version).await?;
-
-        if self.version == prefix {
-            info!("无需更新lqc.lqbin, 当前版本: {version}");
-            return Ok(false);
-        }
-        info!(
-            "lqc.lqbin需要更新, 当前版本: {}, 最新版本: {prefix}",
-            self.version
-        );
-
-        let resp = REQUEST_CLIENT
-            .get(format!(
-                "https://game.maj-soul.com/1/{prefix}/res/config/lqc.lqbin",
-            ))
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .context("Failed to get lqc.lqbin")?;
-
-        let bytes = resp.bytes().await?;
-        let file_dir = self.dir.join("lqc.lqbin");
-        std::fs::write(file_dir, bytes)?;
-        info!("lqc.lqbin更新完成");
-        self.version = prefix;
-        // write settings.mod.json
-        let dir = self.dir.join("settings.mod.json");
-        std::fs::write(dir, serde_json::to_string_pretty(self)?)?;
-        Ok(true)
-    }
-
     pub fn write(&self) {
         let dir = self.dir.join("settings.mod.json");
-        let Ok(contend) = serde_json::to_string_pretty(self) else {
+        let Ok(content) = serde_json::to_string_pretty(self) else {
             error!("Failed to serialize settings.mod.json");
             return;
         };
         spawn(async move {
-            tokio::fs::write(dir, contend)
+            tokio::fs::write(dir, content)
                 .await
                 .inspect_err(|e| error!("Failed to write settings.mod.json: {e}"))
         });

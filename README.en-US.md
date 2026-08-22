@@ -288,14 +288,10 @@ See the [official docs](https://clashparty.org/docs/guide/override/yaml)). In Cl
 
 ## 🤔 Q&A
 
-1. Why are `liqi` and `lqc.lqbin` updated automatically? What if the update fails?
-    - liqi:
-        - Consists of three files, including `liqi.json` and the generated `liqi.proto` and `liqi.desc`, used to parse Mahjong Soul protobuf messages
-        - If the update fails, some messages may not parse (for example, new event messages)
-    - lqc.lqbin:
-        - Used to obtain all characters, outfits, items, and other game assets
-        - If the update fails, new assets (such as new characters and items) may not be available
-    - If auto-update fails, download them from [AutoLiqi > Releases](https://github.com/Xerxes-2/AutoLiqi/releases/latest) and manually replace the files with the same name under `./liqi_config`
+1. Why are the protocol and resource data updated automatically? What if the update fails?
+    - `liqi.desc` describes Mahjong Soul protobuf messages, and the application derives the `liqi.json` RPC map from it. If the update fails, new messages may not parse.
+    - `max_data.yaml` contains character, skin, title, item, loading image, emoji, and ending IDs. If the update fails, new resources will not appear in the unlocked lists.
+    - If auto-update fails, run `python tools/update_proto.py --token <GitHub Token>`; the script updates all three files from [MajsoulData > Releases](https://github.com/Avenshy/MajsoulData/releases/latest).
 2. How do I use this together with my own proxy (VPN / airport)?
     - Use a rule-based proxy with override support (such as `Clash` / `Surge`) to first route Mahjong Soul traffic to the local `MajsoulMax-rs` node, then forward from that node to your original proxy nodes.
     - See “Proxy & Routing” above for example configurations; you can also keep the examples in a separate override file and enable it only when needed.
@@ -305,7 +301,6 @@ See the [official docs](https://clashparty.org/docs/guide/override/yaml)). In Cl
 ## 🛠️ Development Dependencies
 
 -   [Rust](https://www.rust-lang.org/) >= 1.85
--   [Protoc](https://github.com/protocolbuffers/protobuf)
 
 ## 📜 License
 
