@@ -7,7 +7,7 @@ use bytes::Bytes;
 use const_format::formatcp;
 use prost::Message;
 use rand::{rng, seq::IndexedRandom};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
@@ -36,13 +36,7 @@ pub struct Safe {
 
 #[derive(Default)]
 pub struct Modder {
-    characters: Vec<u32>,
-    skins: Vec<u32>,
-    titles: Vec<u32>,
-    items: Vec<u32>,
-    loading_images: Vec<u32>,
-    emojis: HashMap<u32, Vec<u32>>,
-    endings: Vec<u32>,
+    max_data: MaxData,
     mod_settings: RwLock<ModSettings>,
     safe: RwLock<Safe>,
     contract: RwLock<String>,
@@ -56,13 +50,7 @@ pub struct ModifyResult {
 impl Modder {
     pub async fn new(mod_settings: RwLock<ModSettings>, max_data: MaxData) -> Result<Self> {
         let modder = Modder {
-            characters: max_data.character,
-            skins: max_data.skin,
-            titles: max_data.title,
-            items: max_data.item,
-            loading_images: max_data.loading_image,
-            emojis: max_data.emoji,
-            endings: max_data.endings,
+            max_data,
             mod_settings,
             ..Default::default()
         };
@@ -131,12 +119,12 @@ impl Modder {
                 msg.characters
                     .clone_into(&mut self.safe.write().await.characters);
                 msg.characters.clear();
-                for charid in self.characters.iter().copied() {
+                for charid in self.max_data.character.iter().copied() {
                     let character = self.perfect_character(charid).await?;
                     msg.characters.push(character);
                 }
                 msg.skins.clear();
-                msg.skins.extend(self.skins.iter().copied());
+                msg.skins.extend(self.max_data.skin.iter().copied());
                 msg.main_character_id = self.mod_settings.read().await.main_char;
                 msg.character_sort.clear();
                 msg.character_sort
@@ -153,9 +141,9 @@ impl Modder {
                 msg.finished_endings.clear();
                 msg.rewarded_endings.clear();
                 msg.finished_endings
-                    .extend(self.endings.iter().copied());
+                    .extend(self.max_data.endings.iter().copied());
                 msg.rewarded_endings
-                    .extend(self.endings.iter().copied());
+                    .extend(self.max_data.endings.iter().copied());
                 modified_data = Some(msg.encode_to_vec());
             }
             name if name == ".lq.Lobby.login" || name == ".lq.Lobby.oauth2Login" => {
@@ -240,7 +228,7 @@ impl Modder {
             ".lq.Lobby.fetchTitleList" => {
                 let mut msg = lq::ResTitleList::decode(msg_block.data.as_ref())?;
                 msg.title_list.clear();
-                msg.title_list.extend(self.titles.iter().copied());
+                msg.title_list.extend(self.max_data.title.iter().copied());
                 modified_data = Some(msg.encode_to_vec());
             }
             ".lq.Lobby.fetchRoom" => {
@@ -303,12 +291,12 @@ impl Modder {
                         .characters
                         .clone_into(&mut self.safe.write().await.characters);
                     char_info.characters.clear();
-                    for charid in self.characters.iter().copied() {
+                    for charid in self.max_data.character.iter().copied() {
                         let character = self.perfect_character(charid).await?;
                         char_info.characters.push(character);
                     }
                     char_info.skins.clear();
-                    char_info.skins.extend(self.skins.iter().copied());
+                    char_info.skins.extend(self.max_data.skin.iter().copied());
                     char_info.main_character_id = self.mod_settings.read().await.main_char;
                     char_info.character_sort.clear();
                     char_info
@@ -327,10 +315,10 @@ impl Modder {
                     char_info.rewarded_endings.clear();
                     char_info
                         .finished_endings
-                        .extend(self.endings.iter().copied());
+                        .extend(self.max_data.endings.iter().copied());
                     char_info
                         .rewarded_endings
-                        .extend(self.endings.iter().copied());
+                        .extend(self.max_data.endings.iter().copied());
                 }
                 if let Some(ref mut bag_info) = msg.bag_info
                     && let Some(ref mut bag) = bag_info.bag {
@@ -358,7 +346,7 @@ impl Modder {
                     }
                 }
                 msg.title_list = Some(lq::ResTitleList {
-                    title_list: self.titles.clone(),
+                    title_list: self.max_data.title.clone(),
                     ..Default::default()
                 });
                 msg.random_character = Some(lq::ResRandomCharacter {
@@ -462,7 +450,7 @@ impl Modder {
         bag.items.extend(self.safe.read().await.items.iter().cloned());
         let mut seen = bag.items.iter().map(|item| item.item_id).collect::<HashSet<_>>();
 
-        for item_id in self.items.iter().copied() {
+        for item_id in self.max_data.item.iter().copied() {
             if !seen.insert(item_id) {
                 continue;
             }
@@ -472,7 +460,7 @@ impl Modder {
             };
             bag.items.push(new_item);
         }
-        for item_id in self.loading_images.iter().copied() {
+        for item_id in self.max_data.loading_image.iter().copied() {
             if !seen.insert(item_id) {
                 continue;
             }
@@ -560,7 +548,7 @@ impl Modder {
             //int('40'+str(c)[4:]+'01')
             .or_insert(char_id);
         if self.mod_settings.read().await.emoji_on() {
-            if let Some(emojis) = self.emojis.get(&id) {
+            if let Some(emojis) = self.max_data.emoji.get(&id) {
                 character.extra_emoji.extend(emojis);
             }
         }

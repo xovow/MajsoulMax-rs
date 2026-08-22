@@ -339,6 +339,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_list_items_without_panicking() {
+        // Regression: malformed list-item lines must return an error, never panic.
+        for content in [
+            "character:\n- \n",
+            "character:\n- abc\n",
+            "character:\n-\n",
+            "character:\n-\n- 200001\n",
+        ] {
+            assert!(parse_max_data(content).is_err(), "content: {content:?}");
+        }
+    }
+
+    #[test]
     fn generates_rpc_map_from_bundled_descriptor() {
         let json = generate_liqi_json(include_bytes!("../liqi_config/liqi.desc")).unwrap();
         let map: Value = serde_json::from_str(&json).unwrap();
@@ -365,8 +378,6 @@ pub struct ModSettings {
     pub preset_index: u32,
     show_server: bool,
     anti_nickname_censorship: bool,
-    // Kept for settings-file compatibility; resource auto-update is no longer used.
-    auto_update: bool,
     version: String,
     pub random_char_switch: bool,
     pub random_char_pool: Vec<(u32, u32)>,
@@ -391,7 +402,6 @@ impl Default for ModSettings {
             preset_index: 0,
             show_server: true,
             anti_nickname_censorship: true,
-            auto_update: false,
             version: String::new(),
             random_char_switch: false,
             random_char_pool: Vec::new(),
@@ -425,9 +435,6 @@ impl ModSettings {
     }
     pub fn show_server(&self) -> bool {
         self.show_server
-    }
-    pub fn auto_update(&self) -> bool {
-        self.auto_update
     }
     pub fn anti_nickname_censorship(&self) -> bool {
         self.anti_nickname_censorship
