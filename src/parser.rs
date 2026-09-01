@@ -142,7 +142,7 @@ impl Parser {
         let msg_block = BaseMessage::decode(&buf[3..])?;
         let method_name: Arc<str> = Arc::from(msg_block.method_name);
 
-        let (req_type_name, res_type_name) = rpc_types(&self.proto_json, &method_name)?;
+        let (req_type_name, res_type_name) = rpc_types(self.proto_json, &method_name)?;
 
         // Decode request
         let req_type = self
@@ -217,8 +217,12 @@ fn rpc_types<'a>(proto_json: &'a JsonValue, method_name: &str) -> Result<(&'a st
     ensure!(parts.len() >= 4, "Invalid method name format");
     let domain = &proto_json["nested"][parts[1]]["nested"][parts[2]]["methods"][parts[3]];
     Ok((
-        domain["requestType"].as_str().context("Invalid request type")?,
-        domain["responseType"].as_str().context("Invalid response type")?,
+        domain["requestType"]
+            .as_str()
+            .context("Invalid request type")?,
+        domain["responseType"]
+            .as_str()
+            .context("Invalid response type")?,
     ))
 }
 

@@ -24,8 +24,8 @@ pub struct MaxData {
 
 impl MaxData {
     pub fn load(dir: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(dir.join("max_data.yaml"))
-            .context("无法读取max_data.yaml")?;
+        let content =
+            std::fs::read_to_string(dir.join("max_data.yaml")).context("无法读取max_data.yaml")?;
         parse_max_data(&content)
     }
 }
@@ -52,13 +52,7 @@ fn parse_max_data(content: &str) -> Result<MaxData> {
             ensure!(
                 matches!(
                     section.as_str(),
-                    "character"
-                        | "skin"
-                        | "title"
-                        | "item"
-                        | "loading_image"
-                        | "emoji"
-                        | "endings"
+                    "character" | "skin" | "title" | "item" | "loading_image" | "emoji" | "endings"
                 ),
                 "unknown max_data.yaml section on line {}",
                 line_number + 1
@@ -103,7 +97,10 @@ fn parse_max_data(content: &str) -> Result<MaxData> {
         }
     }
 
-    ensure!(!result.character.is_empty(), "max_data.yaml has no characters");
+    ensure!(
+        !result.character.is_empty(),
+        "max_data.yaml has no characters"
+    );
     ensure!(!result.skin.is_empty(), "max_data.yaml has no skins");
     ensure!(!result.title.is_empty(), "max_data.yaml has no titles");
     ensure!(!result.item.is_empty(), "max_data.yaml has no items");
@@ -166,22 +163,20 @@ impl Settings {
                 .context("无法获取可执行文件的父目录")?
                 .join("liqi_config")
         };
-        let content = std::fs::read_to_string(dir.join("settings.json"))
-            .context("无法读取settings.json")?;
+        let content =
+            std::fs::read_to_string(dir.join("settings.json")).context("无法读取settings.json")?;
         let mut settings: Settings =
             serde_json::from_str(&content).context("无法解析settings.json")?;
         settings.methods_set = settings.send_method.iter().cloned().collect();
         settings.actions_set = settings.send_action.iter().cloned().collect();
 
-        let descriptor_bytes =
-            std::fs::read(dir.join("liqi.desc")).context("无法读取liqi.desc")?;
-        let descriptor_set = FileDescriptorSet::decode(descriptor_bytes.as_slice())
-            .context("无法解析liqi.desc")?;
+        let descriptor_bytes = std::fs::read(dir.join("liqi.desc")).context("无法读取liqi.desc")?;
+        let descriptor_set =
+            FileDescriptorSet::decode(descriptor_bytes.as_slice()).context("无法解析liqi.desc")?;
         settings.desc = DescriptorPool::from_file_descriptor_set(descriptor_set)
             .context("无法构建liqi descriptor pool")?;
         settings.proto_json = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("liqi.json"))
-                .context("无法读取liqi.json")?,
+            &std::fs::read_to_string(dir.join("liqi.json")).context("无法读取liqi.json")?,
         )
         .context("无法解析liqi.json")?;
         settings.dir = dir;
@@ -225,7 +220,8 @@ impl Settings {
         if response
             .headers()
             .get("X-RateLimit-Remaining")
-            .and_then(|value| value.to_str().ok()) == Some("0")
+            .and_then(|value| value.to_str().ok())
+            == Some("0")
         {
             bail!("GitHub API rate limit exceeded");
         }
@@ -276,7 +272,9 @@ impl Settings {
             matches!(name, "liqi.desc" | "max_data.yaml"),
             "Unsupported asset: {name}"
         );
-        let url = asset["browser_download_url"].as_str().context("No asset URL")?;
+        let url = asset["browser_download_url"]
+            .as_str()
+            .context("No asset URL")?;
         let client = self.create_github_client()?;
         let mut request = client
             .get(url)
@@ -352,6 +350,82 @@ mod tests {
     }
 
     #[test]
+    fn bundled_mod_settings_deserializes() {
+        let bundled: ModSettings =
+            serde_json::from_str(include_str!("../liqi_config/settings.mod.json")).unwrap();
+        assert_eq!(bundled.main_char, 20000101);
+        assert!(!bundled.char_skin.is_empty());
+    }
+
+    #[test]
+    fn partial_mod_settings_keeps_known_fields_and_defaults_the_rest() {
+        // Regression: 无 serde(default) 时缺任一字段都会整体解析失败，
+        // 进而被默认值覆写 —— 用户配置被静默清空。
+        // 顺带覆盖：旧版遗留的 version / autoUpdate 键应被忽略而非报错。
+        let json = r#"{
+            "mainChar": 200042,
+            "nickname": "雀魂",
+            "version": "v0.11.252.w",
+            "autoUpdate": true
+        }"#;
+
+        let settings: ModSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.main_char, 200042);
+        assert_eq!(settings.nickname, "雀魂");
+        // 未提供的字段回退到默认值，而不是整个配置被重置
+        assert!(settings.hint_on());
+        assert!(settings.show_server());
+        assert_eq!(settings.preset_index, 0);
+    }
+
+    #[test]
+    fn derives_default_avatar_id_for_both_id_widths() {
+        // 6 位和 8 位角色 ID 都存在于 max_data.yaml，规则是取第 5 位起的后缀
+        assert_eq!(ModSettings::default_avatar_id(200001).unwrap(), 400101);
+        assert_eq!(ModSettings::default_avatar_id(200042).unwrap(), 404201);
+        assert_eq!(ModSettings::default_avatar_id(20000125).unwrap(), 40012501);
+    }
+
+    #[test]
+    fn every_bundled_character_has_a_default_avatar_id() {
+        let data = parse_max_data(include_str!("../liqi_config/max_data.yaml")).unwrap();
+        for char_id in data.character {
+            ModSettings::default_avatar_id(char_id)
+                .unwrap_or_else(|e| panic!("角色 {char_id} 推导默认装扮失败: {e}"));
+        }
+    }
+
+    #[test]
+    fn avatar_id_falls_back_when_char_skin_missing() {
+        // Regression: char_skin 是惰性填充的，缺失时不得 panic
+        let mut settings = ModSettings::default();
+        assert!(settings.char_skin.is_empty());
+        assert_eq!(settings.main_avatar_id().unwrap(), 400101);
+
+        settings.char_skin.insert(200001, 400199);
+        assert_eq!(settings.main_avatar_id().unwrap(), 400199);
+    }
+
+    #[test]
+    fn out_of_range_preset_index_falls_back_to_first() {
+        // Regression: preset_index 来自客户端，越界时不得索引定长数组 panic
+        let mut settings = ModSettings::default();
+        settings.views_presets[0] = vec![ViewSlot {
+            slot: 5,
+            r#type: 0,
+            item_id: 305519,
+            item_id_list: vec![],
+        }];
+
+        settings.preset_index = 0;
+        assert_eq!(settings.avatar_frame(), 305519);
+
+        settings.preset_index = 9999;
+        assert_eq!(settings.current_preset().len(), 1);
+        assert_eq!(settings.avatar_frame(), 305519);
+    }
+
+    #[test]
     fn generates_rpc_map_from_bundled_descriptor() {
         let json = generate_liqi_json(include_bytes!("../liqi_config/liqi.desc")).unwrap();
         let map: Value = serde_json::from_str(&json).unwrap();
@@ -363,7 +437,10 @@ mod tests {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
+// serde(default) 不可省略：缺字段会让反序列化整体失败，
+// 而失败分支会用默认值覆写用户的 settings.mod.json，等于静默清空全部配置。
+// 有了它，新增/删除字段才不会波及既有用户。
+#[serde(rename_all = "camelCase", default)]
 pub struct ModSettings {
     pub main_char: u32,
     pub char_skin: HashMap<u32, u32>,
@@ -378,7 +455,6 @@ pub struct ModSettings {
     pub preset_index: u32,
     show_server: bool,
     anti_nickname_censorship: bool,
-    version: String,
     pub random_char_switch: bool,
     pub random_char_pool: Vec<(u32, u32)>,
     pub verified: u32,
@@ -402,7 +478,6 @@ impl Default for ModSettings {
             preset_index: 0,
             show_server: true,
             anti_nickname_censorship: true,
-            version: String::new(),
             random_char_switch: false,
             random_char_pool: Vec::new(),
             verified: 0,
@@ -417,14 +492,71 @@ impl ModSettings {
         let mut settings: Self = match std::fs::read_to_string(&dir) {
             Ok(content) => serde_json::from_str(&content).context("无法解析settings.mod.json")?,
             Err(_) => {
-                let mut default = Self::default();
-                default.dir = general_settings.data_dir().to_path_buf();
+                let default = Self {
+                    dir: general_settings.data_dir().to_path_buf(),
+                    ..Default::default()
+                };
                 default.write();
                 return Ok(default);
             }
         };
         settings.dir = general_settings.data_dir().to_path_buf();
         Ok(settings)
+    }
+
+    /// 角色的默认装扮 ID，规则为 `40{角色号第 5 位起}01`（如 200001 -> 400101，
+    /// 20000125 -> 40012501）。
+    ///
+    /// 必须与 `Modder::perfect_character` 往 `char_skin` 里写入的规则保持一致。
+    pub fn default_avatar_id(char_id: u32) -> Result<u32> {
+        let id_str = char_id.to_string();
+        let slice = id_str
+            .get(4..)
+            .with_context(|| format!("角色 ID {char_id} 过短，无法推导默认装扮"))?;
+        format!("40{slice}01")
+            .parse()
+            .with_context(|| format!("无法解析角色 {char_id} 的默认装扮 ID"))
+    }
+
+    /// 角色当前的装扮 ID。
+    ///
+    /// `char_skin` 是惰性填充的（只有 `perfect_character` 和 `changeCharacterSkin`
+    /// 会写入），所以任何时候都可能缺少某个角色的条目 —— 典型场景是全新安装尚未
+    /// 拉取过角色列表。缺失时退回默认装扮，绝不 panic。
+    pub fn avatar_id_of(&self, char_id: u32) -> Result<u32> {
+        match self.char_skin.get(&char_id) {
+            Some(skin) => Ok(*skin),
+            None => Self::default_avatar_id(char_id),
+        }
+    }
+
+    /// 主角色当前的装扮 ID。
+    pub fn main_avatar_id(&self) -> Result<u32> {
+        self.avatar_id_of(self.main_char)
+    }
+
+    /// 当前生效的装扮预设。
+    ///
+    /// `preset_index` 直接来自客户端的 `useCommonView` / `saveCommonViews` 消息，
+    /// 越界时退回 0 号预设，避免索引定长数组导致 panic。
+    pub fn current_preset(&self) -> &[ViewSlot] {
+        self.views_presets
+            .get(self.preset_index as usize)
+            .unwrap_or(&self.views_presets[0])
+    }
+
+    /// 当前生效预设里的头像框（`slot == 5`）道具 ID。
+    pub fn avatar_frame(&self) -> u32 {
+        self.current_preset()
+            .iter()
+            .find(|v| v.slot == 5)
+            .map(|v| v.item_id)
+            .unwrap_or_default()
+    }
+
+    /// 装扮预设槽位数量。
+    pub fn preset_count(&self) -> usize {
+        self.views_presets.len()
     }
 
     pub fn hint_on(&self) -> bool {

@@ -1,8 +1,6 @@
 /target
 .vscode
 .errorviz-version
-src/proto/lq.rs
-src/proto/sheets.rs
 .DS_Store
 .aider*
 .env

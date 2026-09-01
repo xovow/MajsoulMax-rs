@@ -22,7 +22,8 @@ fn main() -> Result<()> {
             "lq.ViewSlot",
             "#[derive(::serde::Serialize, ::serde::Deserialize)]",
         );
-    config.out_dir("src/proto").compile_fds(descriptor_set)?;
+    // 输出到 OUT_DIR 而非 src/proto，避免生成代码污染 cargo fmt / clippy 的检查范围
+    config.compile_fds(descriptor_set)?;
 
     Ok(())
 }

@@ -19,6 +19,34 @@ permissions:
   contents: write
 
 jobs:
+  check:
+    name: Format, lint & test
+    # 发版（tag push）时不阻断：新工具链引入的 lint 不应该拖住发布。
+    # 如需改成硬门禁，给 build 加上 `needs: check` 即可。
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install APT packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ env.APT_PACKAGES }}
+
+      - name: Install toolchain components
+        run: rustup update && rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
   build:
     name: Build binary
     strategy:
