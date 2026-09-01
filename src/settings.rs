@@ -1,11 +1,11 @@
 use crate::proto::lq::ViewSlot;
 use anyhow::{Context, Result, bail, ensure};
 use prost::Message;
-use prost_reflect::{DescriptorPool, prost_types::FileDescriptorSet};
+use prost_types::FileDescriptorSet;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
 };
 use tokio::spawn;
@@ -117,28 +117,49 @@ fn parse_max_data(content: &str) -> Result<MaxData> {
     Ok(result)
 }
 
+#[derive(Debug, Clone)]
+pub enum LiveModPatch {
+    Nickname(String),
+    ShowServer(bool),
+    AntiNicknameCensorship(bool),
+    EmojiSwitch(bool),
+    HintSwitch(bool),
+}
+
+#[derive(Debug, Clone)]
+pub enum LiqiUpdateStatus {
+    Latest(String),
+    Updated(String),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiqiUpdatePhase {
+    Checking,
+    Downloading,
+}
+
+impl LiqiUpdateStatus {
+    pub fn resolved_after_reload(self, current_version: &str) -> Self {
+        match self {
+            Self::Updated(version) if version == current_version => Self::Latest(version),
+            other => other,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
-    pub send_method: Vec<String>,
-    pub send_action: Vec<String>,
     pub proxy_addr: String,
-    pub api_url: String,
-    helper_switch: bool,
     mod_switch: bool,
     auto_update: bool,
     liqi_version: String,
     github_token: String,
-    #[serde(default)]
-    req_proxy: Option<url::Url>,
-    #[serde(skip)]
-    methods_set: HashSet<String>,
-    #[serde(skip)]
-    actions_set: HashSet<String>,
-    #[serde(skip)]
-    pub desc: DescriptorPool,
-    #[serde(skip)]
-    pub proto_json: Value,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    req_proxy: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    github_prefix: String,
     #[serde(skip)]
     dir: PathBuf,
 }
@@ -148,13 +169,15 @@ const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PK
 impl Settings {
     fn create_github_client(&self) -> Result<reqwest::Client> {
         let mut builder = reqwest::Client::builder().user_agent(APP_USER_AGENT);
-        if let Some(proxy) = &self.req_proxy {
-            builder = builder.proxy(reqwest::Proxy::all(proxy.clone())?);
+        let proxy = self.req_proxy.trim();
+        if !proxy.is_empty() {
+            builder = builder
+                .proxy(reqwest::Proxy::all(proxy).context("Failed to create proxy from reqProxy")?);
         }
         builder.build().context("Failed to build HTTP client")
     }
 
-    pub fn new(arg_dir: &Path) -> Result<Self> {
+    pub fn load_config(arg_dir: &Path) -> Result<Self> {
         let exe = std::env::current_exe().context("无法获取当前可执行文件路径")?;
         let dir = if arg_dir.is_dir() {
             arg_dir.to_path_buf()
@@ -167,33 +190,19 @@ impl Settings {
             std::fs::read_to_string(dir.join("settings.json")).context("无法读取settings.json")?;
         let mut settings: Settings =
             serde_json::from_str(&content).context("无法解析settings.json")?;
-        settings.methods_set = settings.send_method.iter().cloned().collect();
-        settings.actions_set = settings.send_action.iter().cloned().collect();
-
-        let descriptor_bytes = std::fs::read(dir.join("liqi.desc")).context("无法读取liqi.desc")?;
-        let descriptor_set =
-            FileDescriptorSet::decode(descriptor_bytes.as_slice()).context("无法解析liqi.desc")?;
-        settings.desc = DescriptorPool::from_file_descriptor_set(descriptor_set)
-            .context("无法构建liqi descriptor pool")?;
-        settings.proto_json = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("liqi.json")).context("无法读取liqi.json")?,
-        )
-        .context("无法解析liqi.json")?;
         settings.dir = dir;
         Ok(settings)
     }
 
+    pub fn load_protocol(&mut self) -> Result<()> {
+        if let Some(version) = self.stored_liqi_version()? {
+            self.liqi_version = version;
+        }
+        Ok(())
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.dir
-    }
-    pub fn is_method(&self, method: &str) -> bool {
-        self.methods_set.contains(method)
-    }
-    pub fn is_action(&self, action: &str) -> bool {
-        self.actions_set.contains(action)
-    }
-    pub fn helper_on(&self) -> bool {
-        self.helper_switch
     }
     pub fn mod_on(&self) -> bool {
         self.mod_switch
@@ -202,37 +211,87 @@ impl Settings {
         self.auto_update
     }
 
-    pub async fn update(&mut self) -> Result<bool> {
-        let client = self.create_github_client()?;
+    pub fn liqi_version(&self) -> &str {
+        &self.liqi_version
+    }
+
+    pub fn req_proxy(&self) -> &str {
+        &self.req_proxy
+    }
+
+    pub fn github_prefix(&self) -> &str {
+        &self.github_prefix
+    }
+
+    pub fn set_req_proxy(&mut self, value: impl Into<String>) {
+        self.req_proxy = value.into();
+    }
+
+    pub fn set_github_prefix(&mut self, value: impl Into<String>) {
+        self.github_prefix = value.into();
+    }
+
+    fn github_url(&self, url: &str) -> String {
+        apply_github_prefix(&self.github_prefix, url)
+    }
+
+    fn github_request(&self, client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
         let mut request = client
-            .get("https://api.github.com/repos/Avenshy/MajsoulData/releases/latest")
+            .get(self.github_url(url))
             .header("X-GitHub-Api-Version", "2022-11-28")
             .timeout(std::time::Duration::from_secs(10));
         if !self.github_token.is_empty() {
             request = request.header("Authorization", format!("Bearer {}", self.github_token));
         }
-        let response = request
+        request
+    }
+
+    async fn github_latest_release(&self, client: &reqwest::Client) -> Result<Value> {
+        let response = self
+            .github_request(
+                client,
+                "https://api.github.com/repos/Avenshy/MajsoulData/releases/latest",
+            )
             .send()
             .await
-            .context("Failed to get MajsoulData latest release")?
-            .error_for_status()
-            .context("MajsoulData latest release request failed")?;
-        if response
-            .headers()
-            .get("X-RateLimit-Remaining")
-            .and_then(|value| value.to_str().ok())
-            == Some("0")
-        {
-            bail!("GitHub API rate limit exceeded");
+            .context("Failed to get MajsoulData latest release")?;
+        ensure_github_success(&response, "MajsoulData latest release request failed")?;
+        response
+            .json()
+            .await
+            .context("Failed to parse MajsoulData latest release")
+    }
+
+    pub async fn check_and_download_with_progress(
+        &self,
+        mut on_progress: impl FnMut(LiqiUpdatePhase),
+    ) -> LiqiUpdateStatus {
+        match self.update_with_progress(&mut on_progress).await {
+            Ok(Some(version)) => LiqiUpdateStatus::Updated(version),
+            Ok(None) => LiqiUpdateStatus::Latest(self.liqi_version.clone()),
+            Err(error) => LiqiUpdateStatus::Failed(error.to_string()),
         }
-        let release: Value = response.json().await?;
+    }
+
+    async fn update_with_progress(
+        &self,
+        on_progress: &mut impl FnMut(LiqiUpdatePhase),
+    ) -> Result<Option<String>> {
+        on_progress(LiqiUpdatePhase::Checking);
+        let client = self.create_github_client()?;
+        let release = self.github_latest_release(&client).await?;
         let version = release["tag_name"]
             .as_str()
             .context("MajsoulData release has no tag_name")?;
         if self.liqi_version == version {
             info!("无需更新协议和资源数据, 当前版本: {version}");
-            return Ok(false);
+            return Ok(None);
         }
+        if self.stored_liqi_version()?.as_deref() == Some(version) {
+            info!("协议和资源数据已下载，等待重启读取: {version}");
+            return Ok(Some(version.to_owned()));
+        }
+        on_progress(LiqiUpdatePhase::Downloading);
 
         let assets = release["assets"]
             .as_array()
@@ -241,8 +300,8 @@ impl Settings {
         let mut max_data = None;
         for asset in assets {
             match asset["name"].as_str().unwrap_or_default() {
-                "liqi.desc" => descriptor = Some(self.download_asset(asset).await?),
-                "max_data.yaml" => max_data = Some(self.download_asset(asset).await?),
+                "liqi.desc" => descriptor = Some(self.download_asset(&client, asset).await?),
+                "max_data.yaml" => max_data = Some(self.download_asset(&client, asset).await?),
                 _ => {}
             }
         }
@@ -257,16 +316,37 @@ impl Settings {
         std::fs::write(self.dir.join("liqi.desc"), descriptor)?;
         std::fs::write(self.dir.join("max_data.yaml"), max_data)?;
         std::fs::write(self.dir.join("liqi.json"), rpc_map)?;
-        self.liqi_version = version.to_string();
-        std::fs::write(
-            self.dir.join("settings.json"),
-            serde_json::to_string_pretty(self)?,
-        )?;
+        self.write_liqi_version(version)?;
         info!("协议和资源数据更新完成: {version}");
-        Ok(true)
+        Ok(Some(version.to_owned()))
     }
 
-    async fn download_asset(&self, asset: &Value) -> Result<Vec<u8>> {
+    fn stored_liqi_version(&self) -> Result<Option<String>> {
+        let document = self.settings_document()?;
+        Ok(document
+            .get("liqiVersion")
+            .and_then(Value::as_str)
+            .map(str::to_owned))
+    }
+
+    fn write_liqi_version(&self, version: &str) -> Result<()> {
+        let mut document = self.settings_document()?;
+        let object = document
+            .as_object_mut()
+            .context("settings.json 的根节点不是 JSON 对象")?;
+        object.insert("liqiVersion".to_owned(), Value::String(version.to_owned()));
+        let content = serde_json::to_string_pretty(&document)?;
+        std::fs::write(self.dir.join("settings.json"), format!("{content}\n"))
+            .context("无法写入settings.json")
+    }
+
+    fn settings_document(&self) -> Result<Value> {
+        let path = self.dir.join("settings.json");
+        let content = std::fs::read_to_string(&path).context("无法读取settings.json")?;
+        serde_json::from_str(&content).context("无法解析settings.json")
+    }
+
+    async fn download_asset(&self, client: &reqwest::Client, asset: &Value) -> Result<Vec<u8>> {
         let name = asset["name"].as_str().context("No asset name")?;
         ensure!(
             matches!(name, "liqi.desc" | "max_data.yaml"),
@@ -275,20 +355,12 @@ impl Settings {
         let url = asset["browser_download_url"]
             .as_str()
             .context("No asset URL")?;
-        let client = self.create_github_client()?;
-        let mut request = client
-            .get(url)
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .timeout(std::time::Duration::from_secs(10));
-        if !self.github_token.is_empty() {
-            request = request.header("Authorization", format!("Bearer {}", self.github_token));
-        }
-        let response = request
+        let response = self
+            .github_request(client, url)
             .send()
             .await
-            .context("Failed to download asset")?
-            .error_for_status()
-            .context("Asset download failed")?;
+            .context("Failed to download asset")?;
+        ensure_github_success(&response, "Asset download failed")?;
         Ok(response.bytes().await?.to_vec())
     }
 }
@@ -317,6 +389,37 @@ fn generate_liqi_json(bytes: &[u8]) -> Result<String> {
         }
     }
     Ok(serde_json::to_string(&Value::Object(rpc_map))?)
+}
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn apply_github_prefix(prefix: &str, url: &str) -> String {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return url.to_owned();
+    }
+    format!("{}/{url}", prefix.trim_end_matches('/'))
+}
+
+fn ensure_github_success(response: &reqwest::Response, failed_message: &str) -> Result<()> {
+    let rate_limited = response
+        .headers()
+        .get("X-RateLimit-Remaining")
+        .and_then(|value| value.to_str().ok())
+        == Some("0");
+    if rate_limited {
+        bail!("GitHub API rate limit exceeded");
+    }
+    if !response.status().is_success() {
+        bail!("{failed_message}: {}", response.status());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -434,6 +537,37 @@ mod tests {
         assert_eq!(auth_game["req"], ".lq.ReqAuthGame");
         assert_eq!(auth_game["resp"], ".lq.ResAuthGame");
     }
+
+    #[test]
+    fn prefixes_github_urls() {
+        let api = "https://api.github.com/repos/Avenshy/MajsoulData/releases/latest";
+        assert_eq!(apply_github_prefix("", api), api);
+        assert_eq!(apply_github_prefix("   ", api), api);
+        assert_eq!(
+            apply_github_prefix("https://gh-proxy.org/", api),
+            format!("https://gh-proxy.org/{api}")
+        );
+        assert_eq!(
+            apply_github_prefix("https://gh-proxy.org", api),
+            format!("https://gh-proxy.org/{api}")
+        );
+    }
+
+    #[test]
+    fn applies_live_mod_patches() {
+        let mut settings = ModSettings::default();
+        settings.apply_live_patch(&LiveModPatch::Nickname("测试".to_owned()));
+        settings.apply_live_patch(&LiveModPatch::ShowServer(false));
+        settings.apply_live_patch(&LiveModPatch::AntiNicknameCensorship(false));
+        settings.apply_live_patch(&LiveModPatch::EmojiSwitch(true));
+        settings.apply_live_patch(&LiveModPatch::HintSwitch(false));
+
+        assert_eq!(settings.nickname, "测试");
+        assert!(!settings.show_server());
+        assert!(!settings.anti_nickname_censorship());
+        assert!(settings.emoji_on());
+        assert!(!settings.hint_on());
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -496,7 +630,7 @@ impl ModSettings {
                     dir: general_settings.data_dir().to_path_buf(),
                     ..Default::default()
                 };
-                default.write();
+                default.persist();
                 return Ok(default);
             }
         };
@@ -507,7 +641,7 @@ impl ModSettings {
     /// 角色的默认装扮 ID，规则为 `40{角色号第 5 位起}01`（如 200001 -> 400101，
     /// 20000125 -> 40012501）。
     ///
-    /// 必须与 `Modder::perfect_character` 往 `char_skin` 里写入的规则保持一致。
+    /// 必须与 `Modder::build_character` 读取装扮时的回退规则保持一致。
     pub fn default_avatar_id(char_id: u32) -> Result<u32> {
         let id_str = char_id.to_string();
         let slice = id_str
@@ -520,9 +654,8 @@ impl ModSettings {
 
     /// 角色当前的装扮 ID。
     ///
-    /// `char_skin` 是惰性填充的（只有 `perfect_character` 和 `changeCharacterSkin`
-    /// 会写入），所以任何时候都可能缺少某个角色的条目 —— 典型场景是全新安装尚未
-    /// 拉取过角色列表。缺失时退回默认装扮，绝不 panic。
+    /// `char_skin` 只在 `changeCharacterSkin` 时写入，所以任何时候都可能缺少某个
+    /// 角色的条目 —— 典型场景是全新安装尚未换过装扮。缺失时退回默认装扮，绝不 panic。
     pub fn avatar_id_of(&self, char_id: u32) -> Result<u32> {
         match self.char_skin.get(&char_id) {
             Some(skin) => Ok(*skin),
@@ -572,7 +705,17 @@ impl ModSettings {
         self.anti_nickname_censorship
     }
 
-    pub fn write(&self) {
+    pub fn apply_live_patch(&mut self, patch: &LiveModPatch) {
+        match patch {
+            LiveModPatch::Nickname(value) => self.nickname.clone_from(value),
+            LiveModPatch::ShowServer(value) => self.show_server = *value,
+            LiveModPatch::AntiNicknameCensorship(value) => self.anti_nickname_censorship = *value,
+            LiveModPatch::EmojiSwitch(value) => self.emoji_switch = *value,
+            LiveModPatch::HintSwitch(value) => self.hint_switch = *value,
+        }
+    }
+
+    pub fn persist(&self) {
         let dir = self.dir.join("settings.mod.json");
         let Ok(content) = serde_json::to_string_pretty(self) else {
             error!("Failed to serialize settings.mod.json");

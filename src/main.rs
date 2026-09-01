@@ -1,66 +1,240 @@
-use majsoul_max_rs::*;
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install CTRL+C signal handler");
+#[cfg(windows)]
+mod native_sidebar;
+#[cfg(windows)]
+mod webview;
+
+#[cfg(windows)]
+use anyhow::{Context, bail};
+#[cfg(windows)]
+use majsoul_max_rs::*;
+#[cfg(windows)]
+use native_sidebar::ReloadedSettings;
+#[cfg(windows)]
+use std::{net::SocketAddr, path::Path, str::FromStr, sync::Arc, time::Duration};
+#[cfg(windows)]
+use tokio::{
+    sync::{mpsc::UnboundedReceiver, oneshot},
+    task::JoinHandle,
+};
+#[cfg(windows)]
+use webview::ProxyCommand;
+
+#[cfg(windows)]
+fn main() {
+    init_trace();
+    if let Err(error) = run_application() {
+        native_sidebar::show_error_dialog(&format!("{error:#}"));
+    }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    init_trace();
+#[cfg(windows)]
+fn run_application() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to start Tokio runtime")?;
+    let _guard = runtime.enter();
 
-    // print red declaimer text
-    println!(
-        "
-    MajsoulMax-rs {}
-    \x1b[31m
-    本项目完全免费开源，如果您购买了此程序，请立即退款！
-    项目地址: https://github.com/Xerxes-2/MajsoulMax-rs
+    let config_hint = Path::new("./liqi_config");
+    let settings = Settings::load_config(config_hint)?;
+    let config_dir = settings.data_dir().to_path_buf();
+    let proxy_addr = settings.proxy_addr.clone();
+    let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+    let manager_task = runtime.spawn(proxy_manager(config_dir, proxy_addr.clone(), command_rx));
 
-    本程序仅供学习交流使用，严禁用于商业用途！
-    请遵守当地法律法规，对于使用本程序所产生的任何后果，作者概不负责！
-    \x1b[0m",
-        env!("CARGO_PKG_VERSION")
-    );
+    let webview_result = webview::run(&proxy_addr, Arc::new(settings), command_tx.clone());
 
-    let settings = Box::new(Settings::new(std::path::Path::new("./liqi_config"))?);
-    let settings: &'static Settings = Box::leak(settings);
+    let _ = command_tx.send(ProxyCommand::Shutdown);
+    runtime
+        .block_on(manager_task)
+        .context("Proxy manager panicked")?;
+    webview_result
+}
 
-    // show mod and helper switch status, green for on, red for off
-    println!(
-        "\n\x1b[{}mmod: {}\x1b[0m\n\x1b[{}mhelper: {}\x1b[0m\n",
-        if settings.mod_on() { 32 } else { 31 },
-        if settings.mod_on() { "on" } else { "off" },
-        if settings.helper_on() { 32 } else { 31 },
-        if settings.helper_on() { "on" } else { "off" }
-    );
+#[cfg(windows)]
+struct RunningProxy {
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<Result<()>>,
+    modder: Option<Arc<Modder>>,
+}
 
-    if settings.auto_update() {
-        info!("自动更新liqi已开启");
-        let mut new_settings = settings.clone();
-        match new_settings.update().await {
-            Err(e) => warn!("更新liqi失败: {e}"),
-            Ok(true) => {
-                info!("liqi更新成功, 请重启程序");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                return Ok(());
+#[cfg(windows)]
+impl RunningProxy {
+    async fn stop(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        match tokio::time::timeout(Duration::from_secs(2), &mut self.task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => warn!("Proxy stopped with an error: {error}"),
+            Ok(Err(error)) => warn!("Proxy task panicked: {error}"),
+            Err(_) => {
+                self.task.abort();
+                let _ = self.task.await;
             }
-            _ => (),
         }
     }
+}
 
+#[cfg(windows)]
+fn load_proxy_configuration(config_dir: &Path) -> Result<(Arc<Settings>, Option<Arc<Modder>>)> {
+    let mut settings = Settings::load_config(config_dir)?;
+    settings.load_protocol()?;
+    let settings = Arc::new(settings);
     let modder = if settings.mod_on() {
-        // start mod worker
         info!("Mod worker started");
-        // Load after the update check so a legacy installation can fetch the
-        // new resource index before the mod starts.
         let max_data = MaxData::load(settings.data_dir())?;
-        let mod_settings = RwLock::new(ModSettings::new(settings)?);
-        Some(Modder::new(mod_settings, max_data).await?)
+        let mod_settings = RwLock::new(ModSettings::new(settings.as_ref())?);
+        Some(Arc::new(Modder::new(mod_settings, max_data)))
     } else {
         None
     };
+    Ok((settings, modder))
+}
 
-    build_and_start_proxy(settings, modder, shutdown_signal()).await
+#[cfg(windows)]
+async fn start_proxy(settings: Arc<Settings>, modder: Option<Arc<Modder>>) -> Result<RunningProxy> {
+    let proxy_addr = settings.proxy_addr.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let running_modder = modder.clone();
+    let mut task = tokio::spawn(build_and_start_proxy(settings, modder, async move {
+        let _ = shutdown_rx.await;
+    }));
+
+    tokio::select! {
+        biased;
+        result = &mut task => {
+            result.context("Proxy task panicked")??;
+            bail!("Proxy stopped before accepting connections at {proxy_addr}");
+        }
+        readiness = wait_for_proxy(&proxy_addr) => {
+            if let Err(error) = readiness {
+                let _ = shutdown_tx.send(());
+                let _ = task.await;
+                return Err(error);
+            }
+        }
+    }
+    Ok(RunningProxy {
+        shutdown: Some(shutdown_tx),
+        task,
+        modder: running_modder,
+    })
+}
+
+#[cfg(windows)]
+async fn proxy_manager(
+    config_dir: std::path::PathBuf,
+    browser_proxy_addr: String,
+    mut commands: UnboundedReceiver<ProxyCommand>,
+) {
+    let mut running = None;
+    while let Some(command) = commands.recv().await {
+        match command {
+            ProxyCommand::Reload { response } => {
+                let result = reload_proxy(&config_dir, &browser_proxy_addr, &mut running)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = response.send(result);
+            }
+            ProxyCommand::ApplyModPatch(patch) => {
+                if let Some(modder) = running.as_ref().and_then(|proxy| proxy.modder.as_ref()) {
+                    modder.apply_live_patch(patch).await;
+                }
+            }
+            ProxyCommand::Shutdown => break,
+        }
+    }
+    if let Some(proxy) = running {
+        proxy.stop().await;
+    }
+}
+
+#[cfg(windows)]
+async fn reload_proxy(
+    config_dir: &Path,
+    browser_proxy_addr: &str,
+    running: &mut Option<RunningProxy>,
+) -> Result<ReloadedSettings> {
+    let (settings, modder) = load_proxy_configuration(config_dir)?;
+    if settings.proxy_addr != browser_proxy_addr {
+        bail!(
+            "proxyAddr 已从 {browser_proxy_addr} 改为 {}；WebView2 代理地址无法热切换，请关闭程序后重新打开",
+            settings.proxy_addr
+        );
+    }
+
+    if let Some(proxy) = running.take() {
+        proxy.stop().await;
+    }
+    let mut last_error = None;
+    for attempt in 0..2u32 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let _ = wait_for_proxy_stop(browser_proxy_addr).await;
+        match start_proxy(Arc::clone(&settings), modder.clone()).await {
+            Ok(replacement) => {
+                *running = Some(replacement);
+                return Ok(ReloadedSettings { settings });
+            }
+            Err(error) => {
+                warn!("代理启动失败（第 {} 次尝试）: {error}", attempt + 1);
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.expect("the retry loop always runs at least once"))
+}
+
+#[cfg(windows)]
+async fn wait_for_proxy(proxy_addr: &str) -> Result<()> {
+    let ping_url = format!("http://{proxy_addr}/ping");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .context("Failed to build proxy health client")?;
+    for _ in 0..50 {
+        if proxy_is_ready(&client, &ping_url, proxy_addr).await {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("Local proxy did not start at {proxy_addr}")
+}
+
+#[cfg(windows)]
+async fn proxy_is_ready(client: &reqwest::Client, ping_url: &str, proxy_addr: &str) -> bool {
+    if let Ok(response) = client.get(ping_url).send().await
+        && response.status().is_success()
+        && let Ok(body) = response.text().await
+        && body.contains("pong")
+    {
+        return true;
+    }
+    let Ok(addr) = SocketAddr::from_str(proxy_addr) else {
+        return false;
+    };
+    tokio::net::TcpStream::connect(addr).await.is_ok()
+}
+
+#[cfg(windows)]
+async fn wait_for_proxy_stop(proxy_addr: &str) -> Result<()> {
+    let addr = SocketAddr::from_str(proxy_addr)
+        .with_context(|| format!("Invalid proxy address: {proxy_addr}"))?;
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect(addr).await.is_err() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    bail!("旧代理未能释放监听地址 {proxy_addr}")
+}
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("majsoul_max_rs currently supports Windows WebView2 builds only");
 }

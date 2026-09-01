@@ -1,13 +1,13 @@
 use crate::{
     proto::{base::BaseMessage, lq},
-    settings::{MaxData, ModSettings},
+    settings::{LiveModPatch, MaxData, ModSettings},
 };
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use bytes::Bytes;
 use const_format::formatcp;
 use prost::Message;
 use rand::{rng, seq::IndexedRandom};
-use std::collections::HashSet;
+use std::{collections::HashSet, fmt::Write as _};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
@@ -22,16 +22,15 @@ const ANNOUNCEMENT: &str = formatcp!(
 <color=#f9963b>再次重申：脚本完全免费使用，没有收费功能！</color>"
 );
 
+const REQ_HEADER_LEN: usize = 3;
+const NOTIFY_HEADER: [u8; 1] = [0x01];
+
 #[derive(Default)]
-pub struct Safe {
-    pub account_id: u32,
-    pub characters: Vec<lq::Character>,
-    pub main_character_id: u32,
-    pub nickname: String,
-    pub skin: u32,
-    pub title: u32,
-    pub loading_image: Vec<u32>,
-    pub items: Vec<lq::Item>,
+struct Safe {
+    account_id: u32,
+    characters: Vec<lq::Character>,
+    main_character_id: u32,
+    items: Vec<lq::Item>,
 }
 
 #[derive(Default)]
@@ -48,13 +47,16 @@ pub struct ModifyResult {
 }
 
 impl Modder {
-    pub async fn new(mod_settings: RwLock<ModSettings>, max_data: MaxData) -> Result<Self> {
-        let modder = Modder {
+    pub fn new(mod_settings: RwLock<ModSettings>, max_data: MaxData) -> Self {
+        Self {
             max_data,
             mod_settings,
             ..Default::default()
-        };
-        Ok(modder)
+        }
+    }
+
+    pub async fn apply_live_patch(&self, patch: LiveModPatch) {
+        self.mod_settings.write().await.apply_live_patch(&patch);
     }
 
     pub async fn modify(
@@ -63,12 +65,12 @@ impl Modder {
         from_client: bool,
         method_name: impl AsRef<str>,
     ) -> ModifyResult {
-        let msg_type = buf[0];
-        let res = match msg_type {
-            0x01 => self.modify_notify(buf.clone()).await,
-            0x02 => self.modify_req(buf.clone(), from_client).await,
-            0x03 => self.modify_res(buf.clone(), from_client, method_name).await,
-            _ => Err(anyhow!("Unimplemented message type: {msg_type}")),
+        let res = match buf.first().copied() {
+            Some(0x01) => self.modify_notify(buf.clone()).await,
+            Some(0x02) => self.modify_req(buf.clone(), from_client).await,
+            Some(0x03) => self.modify_res(buf.clone(), from_client, method_name).await,
+            Some(msg_type) => Err(anyhow!("Unimplemented message type: {msg_type}")),
+            None => Err(anyhow!("Empty websocket payload")),
         };
         match res {
             Ok(r) => r,
@@ -82,6 +84,12 @@ impl Modder {
         }
     }
 
+    async fn edit_mod_settings(&self, edit: impl FnOnce(&mut ModSettings)) {
+        let mut mod_settings = self.mod_settings.write().await;
+        edit(&mut mod_settings);
+        mod_settings.persist();
+    }
+
     async fn modify_res(
         &self,
         buf: Bytes,
@@ -90,91 +98,55 @@ impl Modder {
     ) -> Result<ModifyResult> {
         let method_name = method_name.as_ref();
         debug!("Respond method: {method_name}");
-        let mut msg_block = BaseMessage::decode(&buf[3..])?;
-        assert!(!from_client);
-        if !msg_block.method_name.is_empty() {
-            bail!("Non-empty respond method name");
-        }
+        ensure!(!from_client, "Respond message came from the client");
+        ensure!(buf.len() >= REQ_HEADER_LEN, "Truncated respond message");
+        let mut msg_block = BaseMessage::decode(&buf[REQ_HEADER_LEN..])?;
+        ensure!(
+            msg_block.method_name.is_empty(),
+            "Non-empty respond method name"
+        );
         let mut modified_data: Option<Vec<u8>> = None;
         match method_name {
             ".lq.Lobby.fetchAccountInfo" => {
                 let mut msg = lq::ResAccountInfo::decode(msg_block.data.as_ref())?;
-                if let Some(ref mut acc) = msg.account
-                    && acc.account_id == self.safe.read().await.account_id
+                let account_id = self.safe.read().await.account_id;
+                if let Some(acc) = msg.account.as_mut()
+                    && acc.account_id == account_id
                 {
-                    acc.avatar_frame = self.mod_settings.read().await.avatar_frame();
-                    acc.avatar_id = self.mod_settings.read().await.main_avatar_id()?;
-                    acc.verified = self.mod_settings.read().await.verified;
+                    let mod_settings = self.mod_settings.read().await;
+                    acc.avatar_frame = mod_settings.avatar_frame();
+                    acc.avatar_id = mod_settings.main_avatar_id()?;
+                    acc.verified = mod_settings.verified;
+                    drop(mod_settings);
                     modified_data = Some(msg.encode_to_vec());
                 }
             }
             ".lq.Lobby.fetchCharacterInfo" => {
                 let mut msg = lq::ResCharacterInfo::decode(msg_block.data.as_ref())?;
-                self.safe.write().await.main_character_id = msg.main_character_id;
-                msg.characters
-                    .clone_into(&mut self.safe.write().await.characters);
-                msg.characters.clear();
-                for charid in self.max_data.character.iter().copied() {
-                    let character = self.perfect_character(charid).await?;
-                    msg.characters.push(character);
-                }
-                msg.skins.clear();
-                msg.skins.extend(self.max_data.skin.iter().copied());
-                msg.main_character_id = self.mod_settings.read().await.main_char;
-                msg.character_sort.clear();
-                msg.character_sort
-                    .extend(self.mod_settings.read().await.star_character.iter());
-                msg.hidden_characters.clear();
-                msg.hidden_characters.extend(
-                    self.mod_settings
-                        .read()
-                        .await
-                        .hidden_characters
-                        .iter()
-                        .copied(),
-                );
-                msg.finished_endings.clear();
-                msg.rewarded_endings.clear();
-                msg.finished_endings
-                    .extend(self.max_data.endings.iter().copied());
-                msg.rewarded_endings
-                    .extend(self.max_data.endings.iter().copied());
+                self.fill_character_info(&mut msg).await?;
                 modified_data = Some(msg.encode_to_vec());
             }
-            name if name == ".lq.Lobby.login" || name == ".lq.Lobby.oauth2Login" => {
+            ".lq.Lobby.login" | ".lq.Lobby.oauth2Login" => {
                 let mut msg = lq::ResLogin::decode(msg_block.data.as_ref())?;
                 self.safe.write().await.account_id = msg.account_id;
-                if let Some(ref mut account) = msg.account {
-                    self.safe
-                        .write()
-                        .await
-                        .nickname
-                        .clone_from(&account.nickname);
-                    self.safe.write().await.skin = account.avatar_id;
-                    self.safe.write().await.title = account.title;
-                    self.safe
-                        .write()
-                        .await
-                        .loading_image
-                        .clone_from(&account.loading_image);
-                    account.avatar_id = self.mod_settings.read().await.main_avatar_id()?;
-                    if !self.mod_settings.read().await.nickname.is_empty() {
-                        account
-                            .nickname
-                            .clone_from(&self.mod_settings.read().await.nickname);
+                if let Some(account) = msg.account.as_mut() {
+                    let mod_settings = self.mod_settings.read().await;
+                    account.avatar_id = mod_settings.main_avatar_id()?;
+                    if !mod_settings.nickname.is_empty() {
+                        account.nickname.clone_from(&mod_settings.nickname);
                     }
-                    account.title = self.mod_settings.read().await.title;
+                    account.title = mod_settings.title;
                     account.loading_image.clear();
                     account
                         .loading_image
-                        .extend(self.mod_settings.read().await.loading_bg.iter());
-                    account.verified = self.mod_settings.read().await.verified;
+                        .extend_from_slice(&mod_settings.loading_bg);
+                    account.verified = mod_settings.verified;
                 }
                 modified_data = Some(msg.encode_to_vec());
             }
             ".lq.Lobby.createRoom" => {
                 let mut msg = lq::ResCreateRoom::decode(msg_block.data.as_ref())?;
-                if let Some(ref mut room) = msg.room {
+                if let Some(room) = msg.room.as_mut() {
                     for p in &mut room.persons {
                         self.change_player(p).await?;
                     }
@@ -183,16 +155,15 @@ impl Modder {
             }
             ".lq.FastTest.authGame" => {
                 let mut msg = lq::ResAuthGame::decode(msg_block.data.as_ref())?;
-                if self.mod_settings.read().await.hint_on()
-                    && let Some(c) = msg.game_config.as_mut()
-                {
+                let hint_on = self.mod_settings.read().await.hint_on();
+                if hint_on && let Some(c) = msg.game_config.as_mut() {
                     if let Some(r) = c.mode.as_mut().and_then(|m| m.detail_rule.as_mut()) {
                         r.bianjietishi = true;
                     }
-                    if let Some(ref mut id) = c.meta.as_mut().map(|m| m.mode_id) {
-                        match *id {
-                            a if (15..=16).contains(&a) => *id -= 4,
-                            b if (25..=26).contains(&b) => *id -= 2,
+                    if let Some(meta) = c.meta.as_mut() {
+                        match meta.mode_id {
+                            15..=16 => meta.mode_id -= 4,
+                            25..=26 => meta.mode_id -= 2,
                             _ => {}
                         }
                     }
@@ -205,12 +176,12 @@ impl Modder {
             ".lq.Lobby.fetchTitleList" => {
                 let mut msg = lq::ResTitleList::decode(msg_block.data.as_ref())?;
                 msg.title_list.clear();
-                msg.title_list.extend(self.max_data.title.iter().copied());
+                msg.title_list.extend_from_slice(&self.max_data.title);
                 modified_data = Some(msg.encode_to_vec());
             }
             ".lq.Lobby.fetchRoom" => {
                 let mut msg = lq::ResSelfRoom::decode(msg_block.data.as_ref())?;
-                if let Some(ref mut room) = msg.room {
+                if let Some(room) = msg.room.as_mut() {
                     for p in &mut room.persons {
                         self.change_player(p).await?;
                     }
@@ -219,32 +190,14 @@ impl Modder {
             }
             ".lq.Lobby.fetchBagInfo" => {
                 let mut msg = lq::ResBagInfo::decode(msg_block.data.as_ref())?;
-                if let Some(ref mut bag) = msg.bag {
-                    self.safe.write().await.items.clone_from(&bag.items);
-                    bag.items.clear();
+                if let Some(bag) = msg.bag.as_mut() {
                     self.fill_bag(bag).await;
                 }
                 modified_data = Some(msg.encode_to_vec());
             }
             ".lq.Lobby.fetchAllCommonViews" => {
                 let mut msg = lq::ResAllcommonViews::decode(msg_block.data.as_ref())?;
-                msg.r#use = self.mod_settings.read().await.preset_index;
-                msg.views.clear();
-                for (i, view) in self
-                    .mod_settings
-                    .read()
-                    .await
-                    .views_presets
-                    .iter()
-                    .enumerate()
-                {
-                    let new_view = lq::res_allcommon_views::Views {
-                        index: i as u32,
-                        name: format!("{}{}", "View", i),
-                        values: view.clone(),
-                    };
-                    msg.views.push(new_view);
-                }
+                self.fill_common_views(&mut msg).await;
                 modified_data = Some(msg.encode_to_vec());
             }
             ".lq.Lobby.fetchAnnouncement" => {
@@ -262,93 +215,30 @@ impl Modder {
             }
             ".lq.Lobby.fetchInfo" => {
                 let mut msg = lq::ResFetchInfo::decode(msg_block.data.as_ref())?;
-                if let Some(ref mut char_info) = msg.character_info {
-                    self.safe.write().await.main_character_id = char_info.main_character_id;
-                    char_info
-                        .characters
-                        .clone_into(&mut self.safe.write().await.characters);
-                    char_info.characters.clear();
-                    for charid in self.max_data.character.iter().copied() {
-                        let character = self.perfect_character(charid).await?;
-                        char_info.characters.push(character);
-                    }
-                    char_info.skins.clear();
-                    char_info.skins.extend(self.max_data.skin.iter().copied());
-                    char_info.main_character_id = self.mod_settings.read().await.main_char;
-                    char_info.character_sort.clear();
-                    char_info
-                        .character_sort
-                        .extend(self.mod_settings.read().await.star_character.iter());
-                    char_info.hidden_characters.clear();
-                    char_info.hidden_characters.extend(
-                        self.mod_settings
-                            .read()
-                            .await
-                            .hidden_characters
-                            .iter()
-                            .copied(),
-                    );
-                    char_info.finished_endings.clear();
-                    char_info.rewarded_endings.clear();
-                    char_info
-                        .finished_endings
-                        .extend(self.max_data.endings.iter().copied());
-                    char_info
-                        .rewarded_endings
-                        .extend(self.max_data.endings.iter().copied());
+                if let Some(char_info) = msg.character_info.as_mut() {
+                    self.fill_character_info(char_info).await?;
                 }
-                if let Some(ref mut bag_info) = msg.bag_info
-                    && let Some(ref mut bag) = bag_info.bag
+                if let Some(bag_info) = msg.bag_info.as_mut()
+                    && let Some(bag) = bag_info.bag.as_mut()
                 {
-                    self.safe.write().await.items.clone_from(&bag.items);
-                    bag.items.clear();
                     self.fill_bag(bag).await;
                 }
-                if let Some(ref mut views) = msg.all_common_views {
-                    views.views.clear();
-                    views.r#use = self.mod_settings.read().await.preset_index;
-                    for (i, view) in self
-                        .mod_settings
-                        .read()
-                        .await
-                        .views_presets
-                        .iter()
-                        .enumerate()
-                    {
-                        let new_view = lq::res_allcommon_views::Views {
-                            index: i as u32,
-                            name: format!("{} {}", "View", i),
-                            values: view.clone(),
-                        };
-                        views.views.push(new_view);
-                    }
+                if let Some(views) = msg.all_common_views.as_mut() {
+                    self.fill_common_views(views).await;
                 }
                 msg.title_list = Some(lq::ResTitleList {
                     title_list: self.max_data.title.clone(),
                     ..Default::default()
                 });
-                msg.random_character = Some(lq::ResRandomCharacter {
-                    enabled: self.mod_settings.read().await.random_char_switch,
-                    pool: self
-                        .mod_settings
-                        .read()
-                        .await
-                        .random_char_pool
-                        .iter()
-                        .map(|(c, s)| lq::RandomCharacter {
-                            character_id: *c,
-                            skin_id: *s,
-                        })
-                        .collect(),
-                    error: None,
-                });
+                msg.random_character = Some(self.random_character().await);
                 modified_data = Some(msg.encode_to_vec());
             }
             ".lq.Lobby.fetchServerSettings" => {
                 let mut msg = lq::ResServerSettings::decode(msg_block.data.as_ref())?;
-                if self.mod_settings.read().await.anti_nickname_censorship()
-                    && let Some(ref mut settings) = msg.settings
-                    && let Some(ref mut nick_setting) = settings.nickname_setting
+                let anti_censorship = self.mod_settings.read().await.anti_nickname_censorship();
+                if anti_censorship
+                    && let Some(settings) = msg.settings.as_mut()
+                    && let Some(nick_setting) = settings.nickname_setting.as_mut()
                 {
                     nick_setting.enable = 0;
                     nick_setting.nicknames.clear();
@@ -359,106 +249,145 @@ impl Modder {
                 let msg = lq::ResGameRecord::decode(msg_block.data.as_ref())?;
                 if let Some(head) = msg.head.as_ref() {
                     let uuid = head.uuid.as_str();
-                    const LOG_HEAD: &str = "发现读入牌谱！\n";
-                    const LOG_TAIL: &str = "注意：只有在同一服务器才能添加好友！";
+                    let anonymous_uuid = encode_uuid(uuid);
+                    let self_account_id = self.safe.read().await.account_id;
                     let mut logs = String::new();
                     for acc in &head.accounts {
-                        match acc.seat {
-                            0 => logs += "东家：",
-                            1 => logs += "南家：",
-                            2 => logs += "西家：",
-                            3 => logs += "北家：",
-                            _ => {}
+                        logs.push_str(match acc.seat {
+                            0 => "东家：",
+                            1 => "南家：",
+                            2 => "西家：",
+                            3 => "北家：",
+                            _ => "",
+                        });
+                        if acc.account_id == self_account_id {
+                            logs.push_str("（自己）");
                         }
-                        if acc.account_id == self.safe.read().await.account_id {
-                            logs += "（自己）";
-                        }
-                        logs += &format!(
-                            "{}\n账号id: {}\t加好友id: {}\n主视角牌谱链接: {uuid}_a{}\n主视角牌谱链接(匿名): {}_a{}_2\n\n",
+                        let anonymous_id = encode_account_id(acc.account_id);
+                        let _ = writeln!(
+                            logs,
+                            "{}\n账号id: {}\t加好友id: {}\n主视角牌谱链接: {uuid}_a{anonymous_id}\n主视角牌谱链接(匿名): {anonymous_uuid}_a{anonymous_id}_2\n",
                             add_zone_id(acc.account_id, &acc.nickname),
                             acc.account_id,
                             encode_account_id2(acc.account_id),
-                            encode_account_id(acc.account_id),
-                            encode_uuid(uuid),
-                            encode_account_id(acc.account_id),
                         );
                     }
-                    info!("{LOG_HEAD}{logs}{LOG_TAIL}");
+                    info!("发现读入牌谱！\n{logs}注意：只有在同一服务器才能添加好友！");
                 }
             }
             ".lq.Lobby.fetchRandomCharacter" => {
                 let mut msg = lq::ResRandomCharacter::decode(msg_block.data.as_ref())?;
-                msg.enabled = self.mod_settings.read().await.random_char_switch;
-                msg.pool = self
-                    .mod_settings
-                    .read()
-                    .await
-                    .random_char_pool
-                    .iter()
-                    .map(|(c, s)| lq::RandomCharacter {
-                        character_id: *c,
-                        skin_id: *s,
-                    })
-                    .collect();
+                let current = self.random_character().await;
+                msg.enabled = current.enabled;
+                msg.pool = current.pool;
                 modified_data = Some(msg.encode_to_vec());
             }
             ".lq.Lobby.setHiddenCharacter" => {
                 let mut msg = lq::ResSetHiddenCharacter::decode(msg_block.data.as_ref())?;
-                msg.hidden_characters = self.mod_settings.read().await.hidden_characters.clone();
+                msg.hidden_characters
+                    .clone_from(&self.mod_settings.read().await.hidden_characters);
                 modified_data = Some(msg.encode_to_vec());
             }
             _ => {}
         }
-        if let Some(data) = modified_data {
-            msg_block.data = data;
-            let mut buf = buf[..3].to_vec();
-            buf.extend(msg_block.encode_to_vec());
-            Ok(ModifyResult {
-                msg: Some(buf.into()),
-                inject_msg: None,
-            })
-        } else {
-            Ok(ModifyResult {
-                msg: Some(buf.to_owned()),
-                inject_msg: None,
-            })
+        let msg = match modified_data {
+            Some(data) => {
+                msg_block.data = data;
+                envelope(&buf[..REQ_HEADER_LEN], &msg_block)
+            }
+            None => buf,
+        };
+        Ok(ModifyResult {
+            msg: Some(msg),
+            inject_msg: None,
+        })
+    }
+
+    async fn fill_character_info(&self, info: &mut lq::ResCharacterInfo) -> Result<()> {
+        {
+            let mut safe = self.safe.write().await;
+            safe.main_character_id = info.main_character_id;
+            safe.characters.clone_from(&info.characters);
+        }
+        let mod_settings = self.mod_settings.read().await;
+        info.characters.clear();
+        info.characters.reserve(self.max_data.character.len());
+        for charid in self.max_data.character.iter().copied() {
+            info.characters
+                .push(self.build_character(&mod_settings, charid)?);
+        }
+        info.skins.clear();
+        info.skins.extend_from_slice(&self.max_data.skin);
+        info.main_character_id = mod_settings.main_char;
+        info.character_sort.clear();
+        info.character_sort
+            .extend_from_slice(&mod_settings.star_character);
+        info.hidden_characters.clear();
+        info.hidden_characters
+            .extend_from_slice(&mod_settings.hidden_characters);
+        info.finished_endings.clear();
+        info.finished_endings
+            .extend_from_slice(&self.max_data.endings);
+        info.rewarded_endings.clear();
+        info.rewarded_endings
+            .extend_from_slice(&self.max_data.endings);
+        Ok(())
+    }
+
+    async fn fill_common_views(&self, views: &mut lq::ResAllcommonViews) {
+        let mod_settings = self.mod_settings.read().await;
+        views.r#use = mod_settings.preset_index;
+        views.views.clear();
+        views.views.reserve(mod_settings.views_presets.len());
+        for (index, preset) in mod_settings.views_presets.iter().enumerate() {
+            views.views.push(lq::res_allcommon_views::Views {
+                index: index as u32,
+                name: format!("View{index}"),
+                values: preset.clone(),
+            });
+        }
+    }
+
+    async fn random_character(&self) -> lq::ResRandomCharacter {
+        let mod_settings = self.mod_settings.read().await;
+        lq::ResRandomCharacter {
+            enabled: mod_settings.random_char_switch,
+            pool: mod_settings
+                .random_char_pool
+                .iter()
+                .map(|&(character_id, skin_id)| lq::RandomCharacter {
+                    character_id,
+                    skin_id,
+                })
+                .collect(),
+            error: None,
         }
     }
 
     async fn fill_bag(&self, bag: &mut lq::Bag) {
-        bag.items
-            .extend(self.safe.read().await.items.iter().cloned());
-        let mut seen = bag
-            .items
+        self.safe.write().await.items.clone_from(&bag.items);
+        let mut seen: HashSet<u32> = bag.items.iter().map(|item| item.item_id).collect();
+        let unlocked = self
+            .max_data
+            .item
             .iter()
-            .map(|item| item.item_id)
-            .collect::<HashSet<_>>();
-
-        for item_id in self.max_data.item.iter().copied() {
-            if !seen.insert(item_id) {
-                continue;
+            .chain(self.max_data.loading_image.iter())
+            .copied();
+        for item_id in unlocked {
+            if seen.insert(item_id) {
+                bag.items.push(lq::Item { item_id, stack: 1 });
             }
-            let new_item = lq::Item { item_id, stack: 1 };
-            bag.items.push(new_item);
-        }
-        for item_id in self.max_data.loading_image.iter().copied() {
-            if !seen.insert(item_id) {
-                continue;
-            }
-            let new_item = lq::Item { item_id, stack: 1 };
-            bag.items.push(new_item);
         }
     }
 
     async fn change_player(&self, p: &mut lq::PlayerGameView) -> Result<()> {
-        if let Some(ref mut character) = p.character {
+        let account_id = self.safe.read().await.account_id;
+        let mod_settings = self.mod_settings.read().await;
+        if let Some(character) = p.character.as_mut() {
             character.is_upgraded = true;
             character.level = 5;
-            if p.account_id == self.safe.read().await.account_id {
-                if self.mod_settings.read().await.random_char_switch
-                    && !self.mod_settings.read().await.random_char_pool.is_empty()
-                {
-                    let mod_settings = self.mod_settings.read().await;
+            if p.account_id == account_id {
+                if mod_settings.random_char_switch && !mod_settings.random_char_pool.is_empty() {
                     let (charid, skin) = mod_settings
                         .random_char_pool
                         .choose(&mut rng())
@@ -467,112 +396,93 @@ impl Modder {
                     p.avatar_id = *skin;
                     character.skin = *skin;
                 } else {
-                    character.charid = self.mod_settings.read().await.main_char;
-                    p.avatar_id = self
-                        .mod_settings
-                        .read()
-                        .await
-                        .avatar_id_of(character.charid)?;
+                    character.charid = mod_settings.main_char;
+                    p.avatar_id = mod_settings.avatar_id_of(character.charid)?;
                     character.skin = p.avatar_id;
                 }
-                *character = self.perfect_character(character.charid).await?;
-                if !self.mod_settings.read().await.nickname.is_empty() {
-                    p.nickname
-                        .clone_from(&self.mod_settings.read().await.nickname);
+                *character = self.build_character(&mod_settings, character.charid)?;
+                if !mod_settings.nickname.is_empty() {
+                    p.nickname.clone_from(&mod_settings.nickname);
                 }
-                p.title = self.mod_settings.read().await.title;
+                p.title = mod_settings.title;
                 p.views.clear();
-                p.views
-                    .extend(self.mod_settings.read().await.current_preset().to_vec());
+                p.views.extend_from_slice(mod_settings.current_preset());
                 p.views.iter_mut().for_each(|v| {
                     if v.r#type == 1 {
-                        v.item_id = v.item_id_list.choose(&mut rng()).unwrap_or(&0).to_owned()
+                        v.item_id = v.item_id_list.choose(&mut rng()).copied().unwrap_or(0);
                     }
                 });
                 // avatar_frame id is view.item_id which view.slot is 5
-                p.avatar_frame = self.mod_settings.read().await.avatar_frame();
-                p.verified = self.mod_settings.read().await.verified;
+                p.avatar_frame = mod_settings.avatar_frame();
+                p.verified = mod_settings.verified;
             }
         }
-        if self.mod_settings.read().await.show_server() {
+        if mod_settings.show_server() {
             p.nickname = add_zone_id(p.account_id, &p.nickname);
         }
         Ok(())
     }
 
-    async fn perfect_character(&self, id: u32) -> Result<lq::Character> {
+    fn build_character(&self, mod_settings: &ModSettings, id: u32) -> Result<lq::Character> {
         let mut character = lq::Character {
             charid: id,
             exp: 0,
             is_upgraded: true,
             level: 5,
+            skin: mod_settings.avatar_id_of(id)?,
             ..Default::default()
         };
-        character.rewarded_level.extend(vec![1, 2, 3, 4, 5]);
-        let default_skin = ModSettings::default_avatar_id(id)?;
-        character.skin = *self
-            .mod_settings
-            .write()
-            .await
-            .char_skin
-            .entry(id)
-            .or_insert(default_skin);
-        if self.mod_settings.read().await.emoji_on()
+        character.rewarded_level.extend([1, 2, 3, 4, 5]);
+        if mod_settings.emoji_on()
             && let Some(emojis) = self.max_data.emoji.get(&id)
         {
-            character.extra_emoji.extend(emojis);
+            character.extra_emoji.extend_from_slice(emojis);
         }
-        character.views.clear();
         character
             .views
-            .extend(self.mod_settings.read().await.current_preset().to_vec());
+            .extend_from_slice(mod_settings.current_preset());
         Ok(character)
     }
 
     async fn modify_req(&self, buf: Bytes, from_client: bool) -> Result<ModifyResult> {
-        let msg_id = u16::from_le_bytes([buf[1], buf[2]]) as usize;
-        let mut msg_block = BaseMessage::decode(&buf[3..])?;
-        // Request message must be from client
-        assert!(from_client);
-        if msg_id >= 1 << 16 {
-            bail!("Invalid request message id: {msg_id}");
-        }
+        ensure!(from_client, "Request message came from the server");
+        ensure!(buf.len() >= REQ_HEADER_LEN, "Truncated request message");
+        let mut msg_block = BaseMessage::decode(&buf[REQ_HEADER_LEN..])?;
         let mut fake = false;
         let method_name = &msg_block.method_name;
         debug!("Request method: {method_name}");
-        let mut inject_data: Option<Vec<u8>> = None;
+        let mut inject_msg: Option<Bytes> = None;
         match method_name.as_str() {
             ".lq.Lobby.changeMainCharacter" => {
                 fake = true;
                 let msg = lq::ReqChangeMainCharacter::decode(msg_block.data.as_ref())?;
-                self.mod_settings.write().await.main_char = msg.character_id;
-                self.mod_settings.read().await.write();
+                self.edit_mod_settings(|s| s.main_char = msg.character_id)
+                    .await;
             }
             ".lq.Lobby.changeCharacterSkin" => {
                 fake = true;
                 let msg = lq::ReqChangeCharacterSkin::decode(msg_block.data.as_ref())?;
-                self.mod_settings
-                    .write()
-                    .await
-                    .char_skin
-                    .insert(msg.character_id, msg.skin);
-                let character = self.perfect_character(msg.character_id).await?;
-                let mut character_update = lq::account_update::CharacterUpdate::default();
-                character_update.characters.push(character);
-                let account_update = lq::AccountUpdate {
-                    character: Some(character_update),
-                    ..Default::default()
+                let mut mod_settings = self.mod_settings.write().await;
+                mod_settings.char_skin.insert(msg.character_id, msg.skin);
+                let character = self.build_character(&mod_settings, msg.character_id)?;
+                mod_settings.persist();
+                drop(mod_settings);
+                let update = lq::NotifyAccountUpdate {
+                    update: Some(lq::AccountUpdate {
+                        character: Some(lq::account_update::CharacterUpdate {
+                            characters: vec![character],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
                 };
-                let update_data = lq::NotifyAccountUpdate {
-                    update: Some(account_update),
-                };
-                let blocks = vec![
-                    Block::String(1, ".lq.NotifyAccountUpdate".into()),
-                    Block::String(2, update_data.encode_to_vec().into()),
-                ];
-                let mut inject_buf = vec![0x01];
-                inject_buf.extend(blocks_to_pb(blocks));
-                inject_data = Some(inject_buf);
+                inject_msg = Some(envelope(
+                    &NOTIFY_HEADER,
+                    &BaseMessage {
+                        method_name: ".lq.NotifyAccountUpdate".to_string(),
+                        data: update.encode_to_vec(),
+                    },
+                ));
             }
             ".lq.Lobby.addFinishedEnding" => {
                 // drop
@@ -584,21 +494,21 @@ impl Modder {
             ".lq.Lobby.updateCharacterSort" => {
                 fake = true;
                 let msg = lq::ReqUpdateCharacterSort::decode(msg_block.data.as_ref())?;
-                self.mod_settings.write().await.star_character = msg.sort;
-                self.mod_settings.write().await.hidden_characters = msg.hidden_characters;
-                self.mod_settings.read().await.write();
+                self.edit_mod_settings(|s| {
+                    s.star_character = msg.sort;
+                    s.hidden_characters = msg.hidden_characters;
+                })
+                .await;
             }
             ".lq.Lobby.useTitle" => {
                 fake = true;
                 let msg = lq::ReqUseTitle::decode(msg_block.data.as_ref())?;
-                self.mod_settings.write().await.title = msg.title;
-                self.mod_settings.read().await.write();
+                self.edit_mod_settings(|s| s.title = msg.title).await;
             }
             ".lq.Lobby.setLoadingImage" => {
                 fake = true;
                 let msg = lq::ReqSetLoadingImage::decode(msg_block.data.as_ref())?;
-                self.mod_settings.write().await.loading_bg = msg.images;
-                self.mod_settings.read().await.write();
+                self.edit_mod_settings(|s| s.loading_bg = msg.images).await;
             }
             ".lq.Lobby.saveCommonViews" => {
                 fake = true;
@@ -610,36 +520,32 @@ impl Modder {
                         _ => {}
                     }
                 }
-                {
-                    // save_index 来自客户端，views_presets 是定长数组，不检查会 panic
-                    let mut mod_settings = self.mod_settings.write().await;
-                    let count = mod_settings.preset_count();
-                    ensure!(
-                        (msg.save_index as usize) < count,
-                        "saveCommonViews 的 save_index {} 越界（共 {count} 个预设）",
-                        msg.save_index
-                    );
-                    mod_settings.views_presets[msg.save_index as usize] = msg.views;
-                    if msg.is_use == 1 {
-                        mod_settings.preset_index = msg.save_index;
-                    }
+                // save_index 来自客户端，views_presets 是定长数组，不检查会 panic
+                let mut mod_settings = self.mod_settings.write().await;
+                let count = mod_settings.preset_count();
+                ensure!(
+                    (msg.save_index as usize) < count,
+                    "saveCommonViews 的 save_index {} 越界（共 {count} 个预设）",
+                    msg.save_index
+                );
+                mod_settings.views_presets[msg.save_index as usize] = msg.views;
+                if msg.is_use == 1 {
+                    mod_settings.preset_index = msg.save_index;
                 }
-                self.mod_settings.read().await.write();
+                mod_settings.persist();
             }
             ".lq.Lobby.useCommonView" => {
                 let msg = lq::ReqUseCommonView::decode(msg_block.data.as_ref())?;
-                {
-                    // index 来自客户端，越界值会被持久化进 settings.mod.json 造成持续损坏
-                    let mut mod_settings = self.mod_settings.write().await;
-                    let count = mod_settings.preset_count();
-                    ensure!(
-                        (msg.index as usize) < count,
-                        "useCommonView 的 index {} 越界（共 {count} 个预设）",
-                        msg.index
-                    );
-                    mod_settings.preset_index = msg.index;
-                }
-                self.mod_settings.read().await.write();
+                // index 来自客户端，越界值会被持久化进 settings.mod.json 造成持续损坏
+                let mut mod_settings = self.mod_settings.write().await;
+                let count = mod_settings.preset_count();
+                ensure!(
+                    (msg.index as usize) < count,
+                    "useCommonView 的 index {} 越界（共 {count} 个预设）",
+                    msg.index
+                );
+                mod_settings.preset_index = msg.index;
+                mod_settings.persist();
             }
             ".lq.Lobby.loginBeat" => {
                 let msg = lq::ReqLoginBeat::decode(msg_block.data.as_ref())?;
@@ -657,54 +563,49 @@ impl Modder {
             ".lq.Lobby.setRandomCharacter" => {
                 fake = true;
                 let msg = lq::ReqRandomCharacter::decode(msg_block.data.as_ref())?;
-                self.mod_settings.write().await.random_char_switch = msg.enabled;
-                self.mod_settings.write().await.random_char_pool = msg
-                    .pool
-                    .iter()
-                    .map(|c| (c.character_id, c.skin_id))
-                    .collect();
-                self.mod_settings.read().await.write();
+                self.edit_mod_settings(|s| {
+                    s.random_char_switch = msg.enabled;
+                    s.random_char_pool = msg
+                        .pool
+                        .iter()
+                        .map(|c| (c.character_id, c.skin_id))
+                        .collect();
+                })
+                .await;
             }
             ".lq.Lobby.setHiddenCharacter" => {
                 fake = true;
                 let msg = lq::ReqSetHiddenCharacter::decode(msg_block.data.as_ref())?;
-                self.mod_settings.write().await.hidden_characters = msg.chara_list;
-                self.mod_settings.read().await.write();
+                self.edit_mod_settings(|s| s.hidden_characters = msg.chara_list)
+                    .await;
             }
             _ => {}
         }
-        if fake {
-            let data = lq::ReqLoginBeat {
-                contract: self.contract.read().await.clone(),
-            };
+        let msg = if fake {
             msg_block.method_name = ".lq.Lobby.loginBeat".to_string();
-            msg_block.data = data.encode_to_vec();
-            let mut buf = buf[..3].to_vec();
-            buf.extend(msg_block.encode_to_vec());
-            Ok(ModifyResult {
-                msg: Some(buf.into()),
-                inject_msg: inject_data.map(|d| d.into()),
-            })
+            msg_block.data = lq::ReqLoginBeat {
+                contract: self.contract.read().await.clone(),
+            }
+            .encode_to_vec();
+            envelope(&buf[..REQ_HEADER_LEN], &msg_block)
         } else {
-            // return original message
-            Ok(ModifyResult {
-                msg: Some(buf.to_owned()),
-                inject_msg: inject_data.map(|d| d.into()),
-            })
-        }
+            buf
+        };
+        Ok(ModifyResult {
+            msg: Some(msg),
+            inject_msg,
+        })
     }
 
     async fn modify_notify(&self, buf: Bytes) -> Result<ModifyResult> {
-        let mut msg_block = BaseMessage::decode(&buf[1..])?;
+        let mut msg_block = BaseMessage::decode(&buf[NOTIFY_HEADER.len()..])?;
         let method_name = &msg_block.method_name;
         debug!("Notify method: {method_name}");
         let mut modified_data: Option<Vec<u8>> = None;
         match method_name.as_str() {
             ".lq.NotifyAccountUpdate" => {
                 let msg = lq::NotifyAccountUpdate::decode(msg_block.data.as_ref())?;
-                if let Some(ref update) = msg.update
-                    && update.character.is_some()
-                {
+                if msg.update.is_some_and(|update| update.character.is_some()) {
                     // drop message if character is updated
                     return Ok(ModifyResult {
                         msg: None,
@@ -714,40 +615,39 @@ impl Modder {
             }
             ".lq.NotifyRoomPlayerUpdate" => {
                 let mut msg = lq::NotifyRoomPlayerUpdate::decode(msg_block.data.as_ref())?;
+                let account_id = self.safe.read().await.account_id;
+                let mod_settings = self.mod_settings.read().await;
+                let show_server = mod_settings.show_server();
                 for player in msg.player_list.iter_mut().chain(msg.robots.iter_mut()) {
-                    if player.account_id == self.safe.read().await.account_id {
-                        player.avatar_id = self.mod_settings.read().await.main_avatar_id()?;
-                        if !self.mod_settings.read().await.nickname.is_empty() {
-                            self.mod_settings
-                                .read()
-                                .await
-                                .nickname
-                                .to_owned()
-                                .clone_into(&mut player.nickname);
+                    if player.account_id == account_id {
+                        player.avatar_id = mod_settings.main_avatar_id()?;
+                        if !mod_settings.nickname.is_empty() {
+                            player.nickname.clone_from(&mod_settings.nickname);
                         }
-                        player.title = self.mod_settings.read().await.title;
+                        player.title = mod_settings.title;
                     }
-                    if self.mod_settings.read().await.show_server() {
+                    if show_server {
                         player.nickname = add_zone_id(player.account_id, &player.nickname);
                     }
                 }
+                drop(mod_settings);
                 modified_data = Some(msg.encode_to_vec());
             }
             ".lq.NotifyGameFinishRewardV2" => {
                 let mut msg = Box::new(lq::NotifyGameFinishRewardV2::decode(
                     msg_block.data.as_ref(),
                 )?);
-                let main = self.safe.read().await.main_character_id;
-                for char in self.safe.write().await.characters.iter_mut() {
-                    if char.charid == main {
-                        if let Some(ref main_char) = msg.main_character {
-                            char.exp = main_char.exp;
-                            char.level = main_char.level;
-                        }
-                        break;
+                {
+                    let mut safe = self.safe.write().await;
+                    let main = safe.main_character_id;
+                    if let Some(main_char) = msg.main_character.as_ref()
+                        && let Some(char) = safe.characters.iter_mut().find(|c| c.charid == main)
+                    {
+                        char.exp = main_char.exp;
+                        char.level = main_char.level;
                     }
                 }
-                if let Some(ref mut main_char) = msg.main_character {
+                if let Some(main_char) = msg.main_character.as_mut() {
                     main_char.add = 0;
                     main_char.exp = 0;
                     main_char.level = 5;
@@ -755,75 +655,79 @@ impl Modder {
                 modified_data = Some(msg.encode_to_vec());
             }
             ".lq.NotifyCustomContestSystemMsg" => {
-                if self.mod_settings.read().await.show_server() {
+                let show_server = self.mod_settings.read().await.show_server();
+                if show_server {
                     let mut msg =
                         lq::NotifyCustomContestSystemMsg::decode(msg_block.data.as_ref())?;
-                    if let Some(ref mut game) = msg.game_start {
-                        game.players.iter_mut().for_each(|p| {
+                    if let Some(game) = msg.game_start.as_mut() {
+                        for p in game.players.iter_mut() {
                             p.nickname = add_zone_id(p.account_id, &p.nickname);
-                        });
+                        }
                         modified_data = Some(msg.encode_to_vec());
                     }
                 }
             }
-            ".lq.NotifyAnnouncementUpdate" => {
-                let msg = lq::NotifyAnnouncementUpdate::decode(msg_block.data.as_ref())?;
-                modified_data = Some(msg.encode_to_vec());
-            }
             _ => {}
         }
-        if let Some(data) = modified_data {
-            // add 0x01 to the beginning of the message
-            msg_block.data = data;
-            let mut buf = vec![0x01];
-            buf.extend(msg_block.encode_to_vec());
-            Ok(ModifyResult {
-                msg: Some(buf.into()),
-                inject_msg: None,
-            })
-        } else {
-            Ok(ModifyResult {
-                msg: Some(buf),
-                inject_msg: None,
-            })
-        }
+        let msg = match modified_data {
+            Some(data) => {
+                msg_block.data = data;
+                envelope(&NOTIFY_HEADER, &msg_block)
+            }
+            None => buf,
+        };
+        Ok(ModifyResult {
+            msg: Some(msg),
+            inject_msg: None,
+        })
     }
+}
+
+fn envelope(header: &[u8], msg_block: &BaseMessage) -> Bytes {
+    let mut buf = Vec::with_capacity(header.len() + msg_block.encoded_len());
+    buf.extend_from_slice(header);
+    let _ = msg_block.encode(&mut buf);
+    buf.into()
 }
 
 fn add_zone_id(id: u32, name: &str) -> String {
     const CN: &str = "[C\u{feff}N]";
-    let zone_code = id >> 23;
-    let zone = match zone_code {
-        code if code <= 6 => CN,
-        code if (7..=12).contains(&code) => "[JP]",
-        code if (13..=15).contains(&code) => "[EN]",
+    let zone = match id >> 23 {
+        0..=6 => CN,
+        7..=12 => "[JP]",
+        13..=15 => "[EN]",
         _ => "[??]",
-    }
-    .to_string();
-    zone + name
+    };
+    let mut tagged = String::with_capacity(zone.len() + name.len());
+    tagged.push_str(zone);
+    tagged.push_str(name);
+    tagged
 }
 
 fn encode_uuid(uuid: &str) -> String {
-    let mut buf = "".to_string();
     const CODE_0: u32 = '0' as u32;
     const CODE_A: u32 = 'a' as u32;
+    let mut buf = String::with_capacity(uuid.len());
     for (i, c) in uuid.chars().enumerate() {
         let code = c as u32;
-        let mut tmp = 0xFF;
-        if (CODE_0..CODE_0 + 10).contains(&code) {
-            tmp = code - CODE_0;
+        let digit = if (CODE_0..CODE_0 + 10).contains(&code) {
+            Some(code - CODE_0)
         } else if (CODE_A..CODE_A + 26).contains(&code) {
-            tmp = code - CODE_A + 10;
-        }
-        if tmp != 0xFF {
-            tmp = (tmp + 17 + i as u32) % 36;
-            if tmp < 10 {
-                buf.push((CODE_0 + tmp) as u8 as char);
-            } else {
-                buf.push((CODE_A + tmp - 10) as u8 as char);
-            }
+            Some(code - CODE_A + 10)
         } else {
-            buf.push(c);
+            None
+        };
+        match digit {
+            Some(digit) => {
+                let shifted = (digit + 17 + i as u32) % 36;
+                let code = if shifted < 10 {
+                    CODE_0 + shifted
+                } else {
+                    CODE_A + shifted - 10
+                };
+                buf.push(code as u8 as char);
+            }
+            None => buf.push(c),
         }
     }
     buf
@@ -841,65 +745,16 @@ fn encode_account_id2(id: u32) -> u32 {
     for _ in 0..5 {
         z = ((511 & z) << 17) | (z >> 9);
     }
-    z + s + 1e7 as u32
-}
-
-enum Block {
-    _VarInt(u32, u64),
-    String(u32, Bytes),
-}
-
-fn blocks_to_pb(blocks: Vec<Block>) -> Bytes {
-    let mut pb = Vec::new();
-    for block in blocks {
-        match block {
-            Block::_VarInt(id, data) => {
-                // ((d['id'] << 3)+0).to_bytes(length=1, byteorder='little')
-                let bytes = (id << 3).to_le_bytes();
-                let byte = bytes[0];
-                pb.push(byte);
-                pb.extend(to_var_int(data));
-            }
-            Block::String(id, data) => {
-                let bytes = ((id << 3) + 2).to_le_bytes();
-                let byte = bytes[0];
-                pb.push(byte);
-                pb.extend(to_var_int(data.len() as u64));
-                pb.extend(data);
-            }
-        }
-    }
-    pb.into()
-}
-
-fn to_var_int(mut x: u64) -> Bytes {
-    if x == 0 {
-        return Bytes::from_static(&[0]);
-    }
-    let mut data: u64 = 0;
-    let mut base = 0;
-    let mut length = 0;
-    while x > 0 {
-        length += 1;
-        data += (x & 127) << base;
-        x >>= 7;
-        if x > 0 {
-            data += 1 << (base + 7);
-        }
-        base += 8;
-    }
-    data.to_le_bytes().into_iter().take(length).collect()
+    z + s + 10_000_000
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    async fn fresh_modder() -> Modder {
+    fn fresh_modder() -> Modder {
         // 全新安装：settings.mod.json 不存在 -> ModSettings::default()，char_skin 为空
         Modder::new(RwLock::new(ModSettings::default()), MaxData::default())
-            .await
-            .unwrap()
     }
 
     fn wrap(msg_type: u8, method_name: &str, data: Vec<u8>) -> Bytes {
@@ -916,7 +771,7 @@ mod tests {
     async fn fetch_account_info_survives_empty_char_skin() {
         // Regression: 曾经直接 char_skin[&main_char] 索引，全新安装时 panic
         // "no entry found for key"
-        let modder = fresh_modder().await;
+        let modder = fresh_modder();
         let res = lq::ResAccountInfo {
             account: Some(lq::Account {
                 account_id: 0, // 与 Safe::default().account_id 相同，进入修改分支
@@ -948,7 +803,7 @@ mod tests {
     async fn out_of_range_use_common_view_is_rejected() {
         // Regression: preset_index 曾被客户端消息直接写入，越界值会持久化进
         // settings.mod.json，之后每次读取都 panic
-        let modder = fresh_modder().await;
+        let modder = fresh_modder();
         let msg = lq::ReqUseCommonView { index: 9999 };
 
         // modify() 内部捕获错误并原样放行，不应 panic
@@ -969,7 +824,7 @@ mod tests {
 
     #[tokio::test]
     async fn out_of_range_save_common_views_is_rejected() {
-        let modder = fresh_modder().await;
+        let modder = fresh_modder();
         let msg = lq::ReqSaveCommonViews {
             save_index: 9999,
             views: vec![],
@@ -986,5 +841,15 @@ mod tests {
             .await;
 
         assert_eq!(modder.mod_settings.read().await.preset_index, 0);
+    }
+
+    #[tokio::test]
+    async fn truncated_frames_do_not_panic() {
+        let modder = fresh_modder();
+        for raw in [vec![], vec![0x03], vec![0x02, 0x00]] {
+            let buf = Bytes::from(raw);
+            let out = modder.modify(buf.clone(), true, "").await;
+            assert_eq!(out.msg.as_deref(), Some(&buf[..]), "短帧应原样放行");
+        }
     }
 }

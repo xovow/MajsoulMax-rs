@@ -7,8 +7,6 @@
 
 Unlock all Mahjong Soul characters, skins, outfits, and more via a man-in-the-middle approach powered by [hudsucker](https://github.com/omjadas/hudsucker). Supports both the web version and the PC / Android client.
 
-Also supports sending live Mahjong Soul games to the [Japanese Mahjong Assistant mahjong-helper](https://github.com/EndlessCheng/mahjong-helper); game log analysis is not supported.
-
 This tool is completely free and open-source—if you paid for it, you were scammed!
 
 ## 🤔 Why Reinvent the Wheel
@@ -56,9 +54,9 @@ You can click the images to join or scan the QR codes.
 
 ## 🥰 Current Features
 
-The program contains two parts: `mod` and `helper`, essentially combining [majsoul_mod_plus](https://github.com/Avenshy/majsoul_mod_plus) and [mahjong-helper-majsoul-mitmproxy](https://github.com/Avenshy/mahjong-helper-majsoul-mitmproxy).
+The program is based on [majsoul_mod_plus](https://github.com/Avenshy/majsoul_mod_plus) and unlocks in-game cosmetics.
 
-By default `helper` is enabled and `mod` is disabled. To customize, edit `modSwitch` and `helperSwitch` in `./liqi_config/settings.json`.
+To toggle Mod, edit `modSwitch` in `./liqi_config/settings.json`.
 
 ### `mod` Features
 
@@ -75,15 +73,11 @@ By default `helper` is enabled and `mod` is disabled. To customize, edit `modSwi
 -   Display the player's server
 -   TODO...
 
-### `helper` Features
-
--   Send live games to [mahjong-helper](https://github.com/EndlessCheng/mahjong-helper)
-
 ## 🧐 Instructions for Use (Windows)
 
 1. Modify the configuration
     - Adjust based on program prompts and your own needs
-    - `liqi_config/settings.json` holds general settings, including the Helper and Mod toggles—`modSwitch` and `helperSwitch`; `false` means off, `true` means on
+    - `liqi_config/settings.json` holds general settings, including the Mod toggle `modSwitch`; `false` means off, `true` means on
     - `liqi_config/settings.mod.json` holds Mod-specific settings
 2. Start the program by running the executable
 3. Start the game (web or client / Steam). Make sure Mahjong Soul traffic goes through the local `majsoul_max_rs` proxy (it listens on `127.0.0.1:23410` by default). A rule-based proxy app with override support such as `Clash` / `Surge` is recommended; see “Proxy & Routing” below for examples.
@@ -289,9 +283,9 @@ See the [official docs](https://clashparty.org/docs/guide/override/yaml)). In Cl
 ## 🤔 Q&A
 
 1. Why are the protocol and resource data updated automatically? What if the update fails?
-    - `liqi.desc` describes Mahjong Soul protobuf messages, and the application derives the `liqi.json` RPC map from it. If the update fails, new messages may not parse.
+    - `liqi.desc` describes Mahjong Soul protobuf messages; it is used at build time to generate protocol code and to derive `liqi.json`.
     - `max_data.yaml` contains character, skin, title, item, loading image, emoji, and ending IDs. If the update fails, new resources will not appear in the unlocked lists.
-    - If auto-update fails, run `python tools/update_proto.py --token <GitHub Token>`; the script updates all three files from [MajsoulData > Releases](https://github.com/Avenshy/MajsoulData/releases/latest).
+    - If auto-update fails, run `python tools/update_proto.py --token <GitHub Token>`; the script updates these files from [MajsoulData > Releases](https://github.com/Avenshy/MajsoulData/releases/latest).
 2. How do I use this together with my own proxy (VPN / airport)?
     - Use a rule-based proxy with override support (such as `Clash` / `Surge`) to first route Mahjong Soul traffic to the local `MajsoulMax-rs` node, then forward from that node to your original proxy nodes.
     - See “Proxy & Routing” above for example configurations; you can also keep the examples in a separate override file and enable it only when needed.

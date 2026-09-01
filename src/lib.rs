@@ -1,12 +1,9 @@
 use anyhow::Context;
 use handler::Handler;
-use helper::helper_worker;
 use hudsucker::{Proxy, certificate_authority::RcgenAuthority, rcgen::KeyPair, rustls};
 use std::{future::Future, net::SocketAddr, str::FromStr, sync::Arc};
-use tokio::sync::mpsc::channel;
 
 mod handler;
-mod helper;
 mod modder;
 mod parser;
 mod proto;
@@ -14,13 +11,11 @@ mod settings;
 
 pub use crate::{
     modder::Modder,
-    settings::{MaxData, ModSettings, Settings},
+    settings::{LiqiUpdatePhase, LiqiUpdateStatus, LiveModPatch, MaxData, ModSettings, Settings},
 };
 pub use anyhow::Result;
 pub use tokio::sync::RwLock;
 pub use tracing::{info, warn};
-
-pub(crate) const ARBITRARY_MD5: &str = "0123456789abcdef0123456789abcdef";
 
 pub fn init_trace() {
     let timer = tracing_subscriber::fmt::time::ChronoLocal::new("%H:%M:%S%.3f".to_string());
@@ -48,8 +43,8 @@ fn generate_ca() -> Result<RcgenAuthority> {
 }
 
 pub async fn build_and_start_proxy<F>(
-    settings: &'static Settings,
-    modder: Option<Modder>,
+    settings: Arc<Settings>,
+    modder: Option<Arc<Modder>>,
     graceful_shutdown: F,
 ) -> Result<()>
 where
@@ -59,30 +54,15 @@ where
 
     let proxy_addr = SocketAddr::from_str(settings.proxy_addr.as_str())
         .context("Failed to parse proxy address")?;
-    let modder = modder.map(Arc::new);
 
-    let (tx, helper) = if settings.helper_on() {
-        let (tx, rx) = channel(32);
-        // start helper worker
-        info!("Helper worker started");
-        let helper_handle = tokio::spawn(helper_worker(rx, settings));
-        (Some(tx), Some(helper_handle))
-    } else {
-        (None, None)
-    };
-    let handler = Handler::new(tx, modder, settings);
+    let handler = Handler::new(modder);
     let proxy = Proxy::builder()
         .with_addr(proxy_addr)
         .with_ca(ca)
         .with_rustls_connector(rustls::crypto::aws_lc_rs::default_provider())
         .with_http_handler(handler.clone())
         .with_websocket_handler(handler)
-        .with_graceful_shutdown(async {
-            graceful_shutdown.await;
-            if let Some(helper) = helper {
-                helper.abort();
-            }
-        })
+        .with_graceful_shutdown(graceful_shutdown)
         .build()
         .context("Failed to build proxy")?;
 

@@ -7,37 +7,24 @@ use hudsucker::{
     *,
 };
 use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc::Sender};
+use tokio::sync::RwLock;
 use tracing::*;
 
-use crate::{
-    modder::Modder,
-    parser::{LiqiMessage, Parser},
-    settings::Settings,
-};
+use crate::{modder::Modder, parser::Parser};
 
 #[derive(Clone)]
 pub struct Handler {
-    sender: Option<Sender<(LiqiMessage, char)>>,
     modder: Option<Arc<Modder>>,
     inject_msg: Option<Message>,
     parser: Arc<RwLock<Parser>>,
 }
 
 impl Handler {
-    pub fn new(
-        sender: Option<Sender<(LiqiMessage, char)>>,
-        modder: Option<Arc<Modder>>,
-        settings: &'static Settings,
-    ) -> Self {
+    pub fn new(modder: Option<Arc<Modder>>) -> Self {
         Self {
-            sender,
             modder,
             inject_msg: None,
-            parser: Arc::new(RwLock::new(Parser::new(
-                &settings.proto_json,
-                &settings.desc,
-            ))),
+            parser: Arc::new(RwLock::new(Parser::new())),
         }
     }
 }
@@ -118,27 +105,20 @@ impl WebSocketHandler for Handler {
             return Some(msg);
         };
 
+        let Some(ref modder) = self.modder else {
+            return Some(Message::Binary(buf));
+        };
+
         let mut parser = self.parser.write().await;
-        let Ok(parsed) = parser.parse(buf.clone()) else {
+        let Ok(method_name) = parser.parse(&buf) else {
             error!("Failed to parse message");
             return Some(Message::Binary(buf));
         };
         drop(parser);
 
-        let method_name = parsed.method_name.clone();
-        if let Some(tx) = &self.sender
-            && let Err(e) = tx.send((parsed, direction_char)).await
-        {
-            error!("Failed to send message to channel: {e}");
-        }
-        let Some(ref modder) = self.modder else {
-            return Some(Message::Binary(buf));
-        };
-        let parser = self.parser.read().await;
         let res = modder
             .modify(buf, direction_char == '\u{2191}', method_name)
             .await;
-        drop(parser);
         if let Some(inj) = res.inject_msg {
             self.inject_msg = Some(Message::Binary(inj));
         }

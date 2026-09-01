@@ -15,6 +15,8 @@ env:
   CARGO_TERM_COLOR: always
   APT_PACKAGES: "build-essential pkg-config libclang-dev"
   BIN_NAME: majsoul_max_rs
+  WINDOWS_TARGET: x86_64-pc-windows-msvc
+
 permissions:
   contents: write
 
@@ -48,117 +50,34 @@ jobs:
         run: cargo test --all-targets
 
   build:
-    name: Build binary
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [linux, musllinux, android, windows, macos]
-        target_arch: [x86_64, aarch64]
-        include:
-          # rust target vendor + system + environment
-          - os: android
-            target_vendor_sys_env: linux-android
-          - os: macos
-            target_vendor_sys_env: apple-darwin
-          - os: linux
-            target_vendor_sys_env: unknown-linux-gnu
-          - os: musllinux
-            target_vendor_sys_env: unknown-linux-musl
-          - os: windows
-            target_vendor_sys_env: pc-windows-msvc
-          # runner
-          - target_arch: x86_64
-            runner: ubuntu-latest
-          - target_arch: aarch64
-            runner: ubuntu-24.04-arm
-          - os: android
-            runner: ubuntu-latest
-          - os: windows
-            # aws-lc-sys 0.32.x does not support the VS 18/MSVC 14.51
-            # toolchain currently selected by windows-latest.
-            runner: windows-2022
-          - os: macos
-            runner: macos-latest
-          # musl packages
-          - os: musllinux
-            musl_packages: "clang musl-tools musl-dev"
-        exclude:
-          - os: android
-            target_arch: x86_64
-
-    runs-on: ${{ matrix.runner }}
+    name: Build binary (windows, x86_64)
+    runs-on: windows-2022
+    env:
+      # Windows 静态 CRT 只给发版构建用。放到全局 RUSTFLAGS 会让 Linux
+      # 上的 proc-macro（clippy/test 需要）编不出来。
+      RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install APT packages
-        if: contains(matrix.runner, 'ubuntu')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{
-            matrix.musl_packages || ''
-          }} ${{
-            env.APT_PACKAGES || ''
-          }}
-
-      - name: Add Rust target
-        shell: bash
-        id: target
-        run: |
-          echo "triple=${{ matrix.target_arch }}-${{matrix.target_vendor_sys_env}}" >> $GITHUB_OUTPUT
-          rustup target add ${{ matrix.target_arch }}-${{matrix.target_vendor_sys_env}} && rustup update
-
-      - uses: nttld/setup-ndk@v1.5.0
-        if: ${{ matrix.os == 'android' }}
-        id: setup-ndk
-        with:
-          ndk-version: r27c
-          add-to-path: true
-
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build ${{ steps.target.outputs.triple }}
-        if: ${{ matrix.os != 'android' }}
+      - name: Build release binary
         shell: bash
-        run: |
-          if [ ${{ matrix.os }} == "musllinux" ]; then
-            export CXX=${{ matrix.target_arch }}-linux-gnu-g++
-            export CFLAGS="-D_FORTIFY_SOURCE=0"
-            export CXXFLAGS="-D_FORTIFY_SOURCE=0"
-          fi
-          if [ ${{ matrix.os }} == "windows" ]; then
-            export RUSTFLAGS="-C target-feature=+crt-static"
-          fi
-          cargo build --release --target ${{ steps.target.outputs.triple }}
+        run: cargo build --release --target "${WINDOWS_TARGET}"
 
-      - name: Build with Android NDK
-        if: ${{ matrix.os == 'android' }}
+      - name: Assemble Windows package
+        shell: pwsh
         run: |
-          cargo install cargo-ndk
-          cargo ndk --target ${{ steps.target.outputs.triple }} build --release
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          $packageDir = Join-Path $env:GITHUB_WORKSPACE "release-package"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          Copy-Item "target/$env:WINDOWS_TARGET/release/$env:BIN_NAME.exe" $packageDir
+          Copy-Item -Recurse "liqi_config" $packageDir
 
-      - name: Move artifacts to work dir and zip
-        shell: bash
-        run: |
-          mv target/${{ steps.target.outputs.triple }}/release/${{ env.BIN_NAME}} .
-          mkdir -p release-package
-          mv ${{ env.BIN_NAME}} release-package/
-          # Include Liqi configuration directory in the packaged artifact
-          cp -r liqi_config release-package/
-          cd release-package
-          if [ ${{ matrix.os }} == "windows" ]; then
-            7z a -tzip ../${{ env.BIN_NAME}}-${{ matrix.os }}-${{matrix.target_arch}}.zip .
-          else
-            zip -r ../${{ env.BIN_NAME}}-${{ matrix.os }}-${{matrix.target_arch}}.zip .
-          fi
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BIN_NAME}}-${{ matrix.os }}-${{matrix.target_arch}}
-          path: ${{ env.BIN_NAME}}-${{ matrix.os }}-${{matrix.target_arch}}.zip
+          name: ${{ env.BIN_NAME }}-windows-x86_64
+          path: release-package/
+          if-no-files-found: error
           retention-days: 1
 
   release:
@@ -169,21 +88,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: master # Ensure we get the latest master with RELEASE_NOTES.md
-          fetch-depth: 0 # Full history for consistency
+          ref: master
+          fetch-depth: 0
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: List downloaded artifacts
-        run: ls -R artifacts
+      - name: Create release archive
+        run: |
+          archive="${BIN_NAME}-windows-x86_64.zip"
+          exe="$(find artifacts -name "${BIN_NAME}.exe" -print -quit)"
+          if [ -z "$exe" ]; then
+            echo "Windows binary not found in artifacts"
+            find artifacts -type f
+            exit 1
+          fi
+          pkg_dir="$(dirname "$exe")"
+          (cd "$pkg_dir" && zip -r "${GITHUB_WORKSPACE}/${archive}" .)
+          unzip -l "${archive}"
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/${{ env.BIN_NAME}}*.zip
+          files: ${{ env.BIN_NAME }}-windows-x86_64.zip
           name: ${{ github.ref_name }}
           draft: false
           prerelease: false
