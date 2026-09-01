@@ -1,147 +1,198 @@
 use anyhow::Result;
+use bytes::Bytes;
 use hudsucker::{
-    Body, HttpContext, RequestOrResponse,
+    Body, HttpContext, HttpHandler, WebSocketContext, WebSocketHandler,
     futures::{Sink, SinkExt, Stream, StreamExt},
-    hyper::{Request, Response, StatusCode},
+    hyper::Request,
     tokio_tungstenite::tungstenite::{self, Message},
-    *,
 };
-use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc::Sender};
-use tracing::*;
+use std::{future::pending, sync::Arc};
+use tokio::sync::mpsc;
 
 use crate::{
+    connections::{ConnectionKey, ConnectionState, Connections},
     modder::Modder,
-    parser::{LiqiMessage, Parser},
-    settings::Settings,
+    parser::{MessageKind, ParsedMessage},
 };
 
 #[derive(Clone)]
 pub struct Handler {
-    sender: Option<Sender<(LiqiMessage, char)>>,
     modder: Option<Arc<Modder>>,
-    inject_msg: Option<Message>,
-    parser: Arc<RwLock<Parser>>,
+    connections: Arc<Connections>,
+}
+
+struct ForwarderGuard(Arc<ConnectionState>);
+
+impl Drop for ForwarderGuard {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 impl Handler {
-    pub fn new(
-        sender: Option<Sender<(LiqiMessage, char)>>,
-        modder: Option<Arc<Modder>>,
-        settings: &'static Settings,
-    ) -> Self {
+    pub fn new(modder: Option<Arc<Modder>>) -> Self {
         Self {
-            sender,
             modder,
-            inject_msg: None,
-            parser: Arc::new(RwLock::new(Parser::new(
-                &settings.proto_json,
-                &settings.desc,
-            ))),
+            connections: Arc::new(Connections::default()),
         }
     }
-}
 
-impl HttpHandler for Handler {
-    async fn handle_request(
-        &mut self,
-        _ctx: &HttpContext,
-        req: Request<Body>,
-    ) -> RequestOrResponse {
-        if req.uri().path() == "/ping" {
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(Body::from("pong"))
-                .expect("Failed to build ping response")
-                .into()
-        } else {
-            req.into()
-        }
-    }
-}
-
-impl WebSocketHandler for Handler {
-    async fn handle_websocket(
-        mut self,
-        ctx: WebSocketContext,
-        mut stream: impl Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
+    fn forward_messages(
+        self,
+        from_client: bool,
+        stream: impl Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
         mut sink: impl Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static,
-    ) {
-        if let WebSocketContext::ServerToClient { .. } = ctx
-            && let Some(msg) = self.inject_msg.take()
-            && let Err(e) = sink.send(msg).await
-        {
-            error!("Failed to send injected message: {e}");
-        }
-        while let Some(message) = stream.next().await {
-            match message {
-                Ok(message) => {
-                    let Some(message) = self.handle_message(&ctx, message).await else {
-                        continue;
+        connection: Option<Arc<ConnectionState>>,
+        mut injections: Option<mpsc::Receiver<Bytes>>,
+    ) -> impl Future<Output = ()> + Send {
+        let guard = connection
+            .as_ref()
+            .map(|state| ForwarderGuard(Arc::clone(state)));
+        let mut closed = connection.as_ref().map(|state| state.subscribe_close());
+        async move {
+            let _guard = guard;
+            let mut stream = stream;
+            let forwarding = async {
+                loop {
+                    let message = tokio::select! {
+                        Some(injected) = async {
+                            match injections.as_mut() {
+                                Some(receiver) => receiver.recv().await,
+                                None => pending().await,
+                            }
+                        } => {
+                            if !send_message(&mut sink, Message::Binary(injected)).await {
+                                break;
+                            }
+                            continue;
+                        }
+                        message = stream.next() => {
+                            match message {
+                                Some(Ok(message)) => message,
+                                Some(Err(_)) => {
+                                    send_message(&mut sink, Message::Close(None)).await;
+                                    break;
+                                }
+                                None => break,
+                            }
+                        }
                     };
-
-                    match sink.send(message).await {
-                        Err(tungstenite::Error::ConnectionClosed) => (),
-                        Err(e) => error!("WebSocket send error: {e}"),
-                        _ => (),
+                    let closing = matches!(message, Message::Close(_));
+                    if let Some(message) = self
+                        .modify_message(from_client, message, connection.as_deref())
+                        .await
+                        && !send_message(&mut sink, message).await
+                    {
+                        break;
+                    }
+                    if closing {
+                        break;
                     }
                 }
-                Err(e) => {
-                    error!("WebSocket message error: {e}");
-
-                    match sink.send(Message::Close(None)).await {
-                        Err(tungstenite::Error::ConnectionClosed) => (),
-                        Err(e) => error!("WebSocket close error: {e}"),
-                        _ => (),
-                    };
-
-                    break;
-                }
+            };
+            tokio::select! {
+                biased;
+                _ = async {
+                    match closed.as_mut() {
+                        Some(receiver) => {
+                            let already_closed = *receiver.borrow_and_update();
+                            if !already_closed {
+                                let _ = receiver.changed().await;
+                            }
+                        }
+                        None => pending().await,
+                    }
+                } => {}
+                _ = forwarding => {}
             }
         }
     }
 
-    async fn handle_message(&mut self, _ctx: &WebSocketContext, msg: Message) -> Option<Message> {
-        let (direction_char, uri) = match _ctx {
-            WebSocketContext::ServerToClient { src, .. } => ('\u{2193}', src),
-            WebSocketContext::ClientToServer { dst, .. } => ('\u{2191}', dst),
-        };
-
-        if uri.path() == "/ob" {
-            // ignore ob messages
+    async fn modify_message(
+        &self,
+        from_client: bool,
+        msg: Message,
+        connection: Option<&ConnectionState>,
+    ) -> Option<Message> {
+        let (Some(modder), Some(connection)) = (&self.modder, connection) else {
             return Some(msg);
-        }
-
-        debug!("{direction_char} {uri}");
-
+        };
         let Message::Binary(buf) = msg else {
             return Some(msg);
         };
-
-        let mut parser = self.parser.write().await;
-        let Ok(parsed) = parser.parse(buf.clone()) else {
-            error!("Failed to parse message");
+        let Ok(parsed) = ParsedMessage::decode(&buf, from_client) else {
             return Some(Message::Binary(buf));
         };
-        drop(parser);
-
-        let method_name = parsed.method_name.clone();
-        if let Some(tx) = &self.sender
-            && let Err(e) = tx.send((parsed, direction_char)).await
-        {
-            error!("Failed to send message to channel: {e}");
-        }
-        let Some(ref modder) = self.modder else {
-            return Some(Message::Binary(buf));
+        let kind = parsed.kind;
+        let response_method = match kind {
+            MessageKind::Request(id) => {
+                // Keep the original method even when the modder substitutes loginBeat.
+                connection.track_request(id, parsed.envelope.method_name.clone());
+                None
+            }
+            MessageKind::Response(id) => match connection.take_request(id) {
+                Some(method) => Some(method),
+                None => return Some(Message::Binary(buf)),
+            },
+            MessageKind::Notify => None,
         };
-        let parser = self.parser.read().await;
         let res = modder
-            .modify(buf, direction_char == '\u{2191}', method_name)
+            .modify_parsed(buf, response_method.as_deref().unwrap_or_default(), parsed)
             .await;
-        drop(parser);
-        if let Some(inj) = res.inject_msg {
-            self.inject_msg = Some(Message::Binary(inj));
+        if res.msg.is_none()
+            && let MessageKind::Request(id) = kind
+        {
+            let _ = connection.take_request(id);
+        }
+        if let Some(injected) = res.inject_msg {
+            let _ = connection.injection_tx.send(injected).await;
         }
         res.msg.map(Message::Binary)
     }
+}
+
+impl HttpHandler for Handler {
+    /// With Mod off nothing is rewritten, so tunnel CONNECT requests unchanged
+    /// instead of paying for TLS interception on every page asset.
+    fn should_intercept_connect(
+        &mut self,
+        _ctx: &HttpContext,
+        _req: &Request<Body>,
+    ) -> impl Future<Output = bool> + Send {
+        let intercept = self.modder.is_some();
+        async move { intercept }
+    }
+}
+
+impl WebSocketHandler for Handler {
+    fn handle_websocket(
+        self,
+        ctx: WebSocketContext,
+        stream: impl Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
+        sink: impl Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static,
+    ) -> impl Future<Output = ()> + Send {
+        let from_client = matches!(ctx, WebSocketContext::ClientToServer { .. });
+        let key = ConnectionKey::from_context(&ctx);
+        let connection = if self.modder.is_some() && !key.is_observer() {
+            Some(self.connections.get(key, from_client))
+        } else {
+            None
+        };
+        let injections = if from_client {
+            None
+        } else {
+            connection
+                .as_ref()
+                .and_then(|state| state.take_injections())
+        };
+        // Register before the future is polled so both forwarders share the same state.
+        self.forward_messages(from_client, stream, sink, connection, injections)
+    }
+}
+
+async fn send_message(
+    sink: &mut (impl Sink<Message, Error = tungstenite::Error> + Unpin + Send),
+    message: Message,
+) -> bool {
+    sink.send(message).await.is_ok()
 }

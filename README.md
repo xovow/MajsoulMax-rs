@@ -7,8 +7,6 @@
 
 雀魂解锁全角色、皮肤、装扮等，基于 [hudsucker](https://github.com/omjadas/hudsucker) 的中间人攻击方式，支持网页版与电脑 / Android 客户端。
 
-同时支持将雀魂的实时牌局发到 [日本麻将助手 mahjong-helper](https://github.com/EndlessCheng/mahjong-helper)，不支持牌谱分析。
-
 本工具完全免费、开源，如果您为此付费，说明您被骗了！
 
 ## 🤔 为什么重新造轮子
@@ -57,9 +55,9 @@
 
 ## 🥰 当前功能
 
-程序包含两部分：`mod` 和 `helper`，可以说是 [雀魂 mod_plus](https://github.com/Avenshy/majsoul_mod_plus) 和 [mahjong-helper-majsoul-mitmproxy](https://github.com/Avenshy/mahjong-helper-majsoul-mitmproxy) 的融合。
+程序基于 [雀魂 mod_plus](https://github.com/Avenshy/majsoul_mod_plus) 实现解锁功能。
 
-程序默认配置为启用 `helper`、禁用 `mod`。如需自定义，请修改 `./liqi_config/settings.json` 中的 `mod_switch` 和 `helper_switch`。
+如需开关 Mod，请修改 `./liqi_config/settings.json` 中的 `modSwitch`。
 
 ### `mod` 功能
 
@@ -76,21 +74,29 @@
 -   显示玩家所在服务器
 -   TODO……
 
-### `helper` 功能
-
--   将对局发送到 [mahjong-helper（雀魂小助手）](https://github.com/EndlessCheng/mahjong-helper)
-
 ## 🧐 使用说明 (Windows)
 
 1. 修改配置
     - 根据程序提示和自身需求修改
-    - 在 `liqi_config/settings.json` 可以设置通用设置，包括 Helper 和 Mod 的开关 ——`modSwitch` 与 `helperSwitch`，`false` 为关 `true` 为开
+    - 在 `liqi_config/settings.json` 可以设置通用设置，包括 Mod 开关 `modSwitch`，`false` 为关 `true` 为开
     - 在 `liqi_config/settings.mod.json` 可以设置 Mod 专有设置
 2. 启动程序，直接运行可执行文件
 3. 启动游戏，分为网页版和客户端 / Steam 端。需要确保雀魂相关流量会经过本地 `majsoul_max_rs` 代理（默认监听 `127.0.0.1:23410`），推荐使用支持规则分流与覆写的代理软件（如 `Clash` / `Surge`），具体示例见下文 “代理与分流” 一节。
     - 网页版：通常只需让浏览器通过系统代理或规则分流使用 `majsoul_max_rs` 节点，无需开启 `TUN` / 增强模式。
     - 客户端 / Steam 端：同样通过 `Clash` / `Surge` 将进程流量分流到 `majsoul_max_rs`，但需要在代理软件中开启 `TUN` / 增强模式，否则本地进程流量不会被劫持。
 4. 登录游戏开始享受
+
+桌面侧边栏的“自动检查更新”支持三种方式：
+
+| 方式 | `settings.json` 中的 `autoUpdate` | 行为 |
+| --- | --- | --- |
+| 启动时检查更新 | `"startup"` | 启动时检查一次，完成后加载游戏 |
+| 定时检查更新 | `"periodic"` | 按设置的分钟间隔检查，首次检查在一个完整间隔后执行 |
+| 关闭检查更新 | `"disabled"` | 停止自动检查 |
+
+“检查间隔”仅在定时模式下可编辑，范围为 1–65535 分钟，默认 60 分钟，对应配置项 `autoUpdateIntervalMinutes`。修改方式或间隔后自动保存并立即调整检查计划，无需重新加载；选择“启动时检查更新”后，下次启动执行检查。旧配置中的 `autoUpdate: true/false` 分别按“启动时检查更新/关闭检查更新”读取。
+
+三种方式均保留“检查更新”按钮。正在检查或重载代理时不会重复发起定时检查；定时或手动下载新数据后，可点击“重新加载配置并刷新网页”应用。
 
 macOS 或 Linux 用户，可以参考 Windows 的步骤，步骤 3 有所不同。
 
@@ -295,9 +301,9 @@ function main(config) {
 ## 🤔 Q&A
 
 1. 为什么要自动更新协议和资源数据？更新失败有什么影响？
-    - `liqi.desc` 描述雀魂 protobuf 消息，程序会根据它生成 RPC 映射 `liqi.json`。更新失败时，新消息可能无法解析。
+    - `liqi.desc` 描述雀魂 protobuf 消息，构建时用于生成协议代码。
     - `max_data.yaml` 包含角色、皮肤、称号、物品、加载图、表情和传记 ID。更新失败时，新资源不会出现在解锁列表中。
-    - 如果自动更新失败，可以运行 `python tools/update_proto.py --token <GitHub Token>`；脚本会从 [MajsoulData > Releases](https://github.com/Avenshy/MajsoulData/releases/latest) 更新全部三个文件。
+    - 如果自动更新失败，可以运行 `python tools/update_proto.py --token <GitHub Token>`；脚本会从 [MajsoulData > Releases](https://github.com/Avenshy/MajsoulData/releases/latest) 更新这些文件。
 2. 如何同时启用自己的代理（机场 / VPN）？
     - 推荐使用支持规则和覆写的代理软件（如 `Clash` / `Surge`），将雀魂相关流量首先分流到本地 `MajsoulMax-rs` 节点，再由该节点转发到你原有的代理节点。
     - 具体示例配置见上文 “代理与分流” 一节，你也可以将示例写成单独的覆写配置文件，在需要时再启用。

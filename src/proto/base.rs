@@ -6,6 +6,6 @@
 pub struct BaseMessage {
     #[prost(string, tag = "1")]
     pub method_name: ::prost::alloc::string::String,
-    #[prost(bytes = "vec", tag = "2")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub data: ::bytes::Bytes,
 }
