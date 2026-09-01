@@ -38,7 +38,7 @@ jobs:
       - name: Update data files
         if: steps.compare_versions.outputs.update_needed == 'true'
         run: |
-          python -m pip install protobuf requests
+          python -m pip install requests
           python tools/update_proto.py --token "${{ secrets.GITHUB_TOKEN }}"
 
       - name: Create Pull Request
@@ -53,7 +53,6 @@ jobs:
 
             Changes:
             - Updated liqi.desc
-            - Updated liqi.json
             - Updated max_data.yaml
             - Updated version in settings.json
           branch: update-liqi-files

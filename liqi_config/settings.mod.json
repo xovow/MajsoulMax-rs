@@ -119,7 +119,7 @@
   "nickname": "",
   "starCharacter": [],
   "hiddenCharacters": [],
-  "hintSwitch": true,
+  "hintSwitch": false,
   "title": 0,
   "loadingBg": [],
   "emojiSwitch": false,
@@ -196,7 +196,7 @@
   ],
   "presetIndex": 0,
   "showServer": true,
-  "antiNicknameCensorship": true,
+  "antiNicknameCensorship": false,
   "randomCharSwitch": false,
   "randomCharPool": [],
   "verified": 0
