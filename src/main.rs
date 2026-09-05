@@ -1,7 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 #[cfg(windows)]
-mod native_sidebar;
+mod sidebar;
 #[cfg(windows)]
 mod webview;
 
@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 #[cfg(windows)]
 use majsoul_max_rs::*;
 #[cfg(windows)]
-use native_sidebar::ReloadedSettings;
+use sidebar::ReloadedSettings;
 #[cfg(windows)]
 use std::{net::SocketAddr, path::Path, str::FromStr, sync::Arc, time::Duration};
 #[cfg(windows)]
@@ -25,7 +25,7 @@ use webview::ProxyCommand;
 fn main() {
     init_trace();
     if let Err(error) = run_application() {
-        native_sidebar::show_error_dialog(&format!("{error:#}"));
+        sidebar::show_error_dialog(&format!("{error:#}"));
     }
 }
 
@@ -238,3 +238,4 @@ async fn wait_for_proxy_stop(proxy_addr: &str) -> Result<()> {
 fn main() {
     eprintln!("majsoul_max_rs currently supports Windows WebView2 builds only");
 }
+

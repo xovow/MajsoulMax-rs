@@ -45,14 +45,16 @@ prost-types = "0.14"
 
 # The desktop shell is intentionally Windows-only.  Keeping these dependencies
 # target-specific means the proxy/modder library remains independent of the
-# WebView2/GUI stack, while Windows release builds get a native WebView2 host.
+# WebView2/GUI stack, while Windows release builds get a native WebView2 host
+# with an egui settings sidebar.
 [target.'cfg(windows)'.dependencies]
 tao = "0.30"
 wry = "0.45"
+egui = "0.36"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
-    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

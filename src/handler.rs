@@ -51,7 +51,10 @@ impl WebSocketHandler for Handler {
     async fn handle_websocket(
         mut self,
         ctx: WebSocketContext,
-        mut stream: impl Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
+        mut stream: impl Stream<Item = Result<Message, tungstenite::Error>>
+            + Unpin
+            + Send
+            + 'static,
         mut sink: impl Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static,
     ) {
         if let WebSocketContext::ServerToClient { .. } = ctx

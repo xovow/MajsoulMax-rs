@@ -1,5 +1,5 @@
-use crate::native_sidebar::{
-    GuiEvent, InitialValues, NativeSidebar, ReloadedSettings, SettingChange,
+use crate::sidebar::{
+    GuiEvent, InitialValues, ReloadedSettings, SettingChange, Sidebar,
 };
 use anyhow::{Context, Result};
 use majsoul_max_rs::{LiqiUpdatePhase, LiveModPatch, Settings};
@@ -104,14 +104,14 @@ pub fn run(
         .context("Failed to create application window")?;
 
     let event_proxy = event_loop.create_proxy();
-    let sidebar = NativeSidebar::new(
+    let sidebar = Sidebar::new(
         window.hwnd() as HWND,
         event_proxy.clone(),
         &initial,
         window.scale_factor(),
     )?;
     let mut game_webview: Option<WebView> = None;
-    let mut scroll_position = apply_layout(&window, &sidebar, None, &gui_state, 0)?;
+    apply_layout(&window, &sidebar, None, &gui_state)?;
     window.set_visible(true);
 
     let runtime = tokio::runtime::Handle::current();
@@ -162,15 +162,10 @@ pub fn run(
                 }
                 WindowEvent::Resized(_) => {
                     capture_window_state(&window, &mut gui_state);
-                    match apply_layout(
-                        &window,
-                        &sidebar,
-                        game_webview.as_ref(),
-                        &gui_state,
-                        scroll_position,
-                    ) {
-                        Ok(position) => scroll_position = position,
-                        Err(error) => tracing::warn!("Failed to resize GUI: {error}"),
+                    if let Err(error) =
+                        apply_layout(&window, &sidebar, game_webview.as_ref(), &gui_state)
+                    {
+                        tracing::warn!("Failed to resize GUI: {error}");
                     }
                 }
                 WindowEvent::Moved(_) => capture_window_state(&window, &mut gui_state),
@@ -282,15 +277,10 @@ pub fn run(
                                 }
                             }
                         }
-                        match apply_layout(
-                            &window,
-                            &sidebar,
-                            game_webview.as_ref(),
-                            &gui_state,
-                            scroll_position,
-                        ) {
-                            Ok(position) => scroll_position = position,
-                            Err(error) => tracing::warn!("Failed to layout GUI: {error}"),
+                        if let Err(error) =
+                            apply_layout(&window, &sidebar, game_webview.as_ref(), &gui_state)
+                        {
+                            tracing::warn!("Failed to layout GUI: {error}");
                         }
                         if !first_start {
                             if let Some(webview) = game_webview.as_ref() {
@@ -314,16 +304,10 @@ pub fn run(
             }
             Event::UserEvent(GuiEvent::ToggleSidebar) => {
                 gui_state.sidebar_collapsed = !gui_state.sidebar_collapsed;
-                scroll_position = 0;
-                match apply_layout(
-                    &window,
-                    &sidebar,
-                    game_webview.as_ref(),
-                    &gui_state,
-                    scroll_position,
-                ) {
-                    Ok(position) => scroll_position = position,
-                    Err(error) => sidebar.set_message(&format!("调整侧栏失败：{error}")),
+                if let Err(error) =
+                    apply_layout(&window, &sidebar, game_webview.as_ref(), &gui_state)
+                {
+                    sidebar.set_message(&format!("调整侧栏失败：{error}"));
                 }
                 if let Err(error) = save_gui_state(&state_path, &gui_state) {
                     sidebar.set_message(&format!("无法保存侧栏状态：{error}"));
@@ -331,7 +315,6 @@ pub fn run(
             }
             Event::UserEvent(GuiEvent::SidebarDragStart(screen_x)) => {
                 if !gui_state.sidebar_collapsed {
-                    sidebar.set_dragging(true);
                     drag_origin = Some((screen_x, gui_state.sidebar_width));
                 }
             }
@@ -344,27 +327,15 @@ pub fn run(
                         .width;
                     gui_state.sidebar_width = (origin_width + logical_delta)
                         .clamp(MIN_SIDEBAR_WIDTH, max_sidebar_width(window_width));
-                    if let Ok(position) = apply_layout(
-                        &window,
-                        &sidebar,
-                        game_webview.as_ref(),
-                        &gui_state,
-                        scroll_position,
-                    ) {
-                        scroll_position = position;
-                    }
+                    let _ = apply_layout(&window, &sidebar, game_webview.as_ref(), &gui_state);
                 }
             }
             Event::UserEvent(GuiEvent::SidebarDragEnd) => {
-                sidebar.set_dragging(false);
                 if drag_origin.take().is_some()
                     && let Err(error) = save_gui_state(&state_path, &gui_state)
                 {
                     sidebar.set_message(&format!("无法保存侧栏宽度：{error}"));
                 }
-            }
-            Event::UserEvent(GuiEvent::ScrollTo(position)) => {
-                scroll_position = sidebar.scroll_to(position);
             }
             _ => {}
         }
@@ -374,11 +345,10 @@ pub fn run(
 
 fn apply_layout(
     window: &Window,
-    sidebar: &NativeSidebar,
+    sidebar: &Sidebar,
     game_webview: Option<&WebView>,
     state: &GuiState,
-    scroll_position: i32,
-) -> Result<i32> {
+) -> Result<()> {
     let inner_size = window.inner_size();
     let scale_factor = window.scale_factor();
     let logical_width = inner_size.to_logical::<f64>(scale_factor).width;
@@ -405,13 +375,13 @@ fn apply_layout(
             })
             .context("Failed to resize game WebView2")?;
     }
-    Ok(sidebar.layout(
+    sidebar.layout(
         sidebar_width as i32,
         inner_size.height as i32,
         scale_factor,
         state.sidebar_collapsed,
-        scroll_position,
-    ))
+    );
+    Ok(())
 }
 
 fn create_game_webview(window: &Window, proxy_addr: &str) -> Result<WebView> {
@@ -424,7 +394,7 @@ fn create_game_webview(window: &Window, proxy_addr: &str) -> Result<WebView> {
 }
 
 fn begin_proxy_reload(
-    sidebar: &NativeSidebar,
+    sidebar: &Sidebar,
     proxy_commands: &tokio::sync::mpsc::UnboundedSender<ProxyCommand>,
     event_proxy: &EventLoopProxy<GuiEvent>,
     runtime: &tokio::runtime::Handle,
@@ -478,7 +448,7 @@ fn load_initial_values(settings: &Settings) -> InitialValues {
 }
 
 fn persist_pending_changes(
-    sidebar: &NativeSidebar,
+    sidebar: &Sidebar,
     config_dir: &Path,
     current_settings: &mut Arc<Settings>,
     proxy_commands: &tokio::sync::mpsc::UnboundedSender<ProxyCommand>,
