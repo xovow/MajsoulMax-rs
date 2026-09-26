@@ -24,6 +24,8 @@ const ANNOUNCEMENT: &str = concat!(
 
 const NOTIFY_HEADER: [u8; 1] = [0x01];
 
+const RESOURCE_TARGET: &str = "majsoul_max_rs::resource";
+
 pub type SaveErrorHandler = Box<dyn Fn(String) + Send + Sync>;
 
 #[derive(Default)]
@@ -81,10 +83,12 @@ impl Modder {
 
     fn persist_settings(&self, settings: &ModSettings) {
         // A disk error must not forward a local-only edit to the game server.
-        if let Err(error) = settings.persist()
-            && let Some(handler) = &self.save_error_handler
-        {
-            handler(format!("设置保存失败，本次修改未写入文件：{error:#}"));
+        if let Err(error) = settings.persist() {
+            let message = format!("设置保存失败，本次修改未写入文件：{error:#}");
+            tracing::error!(target: RESOURCE_TARGET, "{message}");
+            if let Some(handler) = &self.save_error_handler {
+                handler(message);
+            }
         }
     }
 
@@ -123,7 +127,13 @@ impl Modder {
                     .await
             }
         };
-        res.unwrap_or_else(|_| ModifyResult::forward(buf))
+        res.unwrap_or_else(|error| {
+            tracing::error!(
+                target: RESOURCE_TARGET,
+                "{method_name} 改写失败，已原样转发：{error:#}"
+            );
+            ModifyResult::forward(buf)
+        })
     }
 
     async fn edit_mod_settings(&self, edit: impl FnOnce(&mut ModSettings)) {
@@ -200,6 +210,15 @@ impl Modder {
                             _ => {}
                         }
                     }
+                }
+                let account_id = self.safe.read().await.account_id;
+                if !msg.players.iter().any(|p| p.account_id == account_id) {
+                    // Usually the proxy was (re)started after login, so login was never seen.
+                    tracing::warn!(
+                        target: RESOURCE_TARGET,
+                        account_id,
+                        "对局玩家中找不到本人，本局不会应用 Mod 的角色和装扮；请刷新网页重新登录"
+                    );
                 }
                 for p in &mut msg.players {
                     self.change_player(p).await?;
@@ -331,6 +350,13 @@ impl Modder {
         info.rewarded_endings.clear();
         info.rewarded_endings
             .extend_from_slice(&self.max_data.endings);
+        let characters = info.characters.len();
+        let skins = info.skins.len();
+        let emoji_on = mod_settings.emoji_on();
+        tracing::debug!(
+            target: RESOURCE_TARGET,
+            "解锁角色 {characters} 个、装扮 {skins} 套；额外表情开关={emoji_on}"
+        );
         Ok(())
     }
 
@@ -366,6 +392,7 @@ impl Modder {
 
     async fn fill_bag(&self, bag: &mut lq::Bag) {
         self.safe.write().await.items.clone_from(&bag.items);
+        let owned = bag.items.len();
         let mut seen: HashSet<u32> = bag.items.iter().map(|item| item.item_id).collect();
         let unlocked = self
             .max_data
@@ -378,6 +405,11 @@ impl Modder {
                 bag.items.push(lq::Item { item_id, stack: 1 });
             }
         }
+        let added = bag.items.len() - owned;
+        tracing::debug!(
+            target: RESOURCE_TARGET,
+            "背包道具：已拥有 {owned} 件，Mod 补充 {added} 件"
+        );
     }
 
     async fn change_player(&self, p: &mut lq::PlayerGameView) -> Result<()> {
@@ -415,6 +447,24 @@ impl Modder {
                 // avatar_frame id is view.item_id which view.slot is 5
                 p.avatar_frame = mod_settings.avatar_frame();
                 p.verified = mod_settings.verified;
+                if p.views.is_empty() {
+                    let index = mod_settings.preset_index;
+                    tracing::warn!(
+                        target: RESOURCE_TARGET,
+                        preset = index,
+                        "装扮预设为空，本人不会带任何装扮（含和牌、立直、鸣牌特效）；\
+                         请在游戏装扮页保存一次预设"
+                    );
+                }
+                tracing::debug!(
+                    target: RESOURCE_TARGET,
+                    "本人形象：角色 {} 皮肤 {} 额外表情 {} 个；对局装扮 [{}]；角色装扮 [{}]",
+                    character.charid,
+                    character.skin,
+                    character.extra_emoji.len(),
+                    describe_views(&p.views),
+                    describe_views(&character.views),
+                );
             }
         }
         if mod_settings.show_server() {
@@ -525,6 +575,13 @@ impl Modder {
                 if msg.is_use == 1 {
                     mod_settings.preset_index = msg.save_index;
                 }
+                let index = msg.save_index;
+                let saved = &mod_settings.views_presets[index as usize];
+                tracing::debug!(
+                    target: RESOURCE_TARGET,
+                    "保存装扮预设 #{index}：[{}]",
+                    describe_views(saved)
+                );
                 self.persist_settings(&mod_settings);
             }
             ".lq.Lobby.useCommonView" => {
@@ -538,6 +595,13 @@ impl Modder {
                     msg.index
                 );
                 mod_settings.preset_index = msg.index;
+                let index = msg.index;
+                let current = mod_settings.current_preset();
+                tracing::debug!(
+                    target: RESOURCE_TARGET,
+                    "切换装扮预设 #{index}：[{}]",
+                    describe_views(current)
+                );
                 self.persist_settings(&mod_settings);
             }
             ".lq.Lobby.loginBeat" => {
@@ -552,6 +616,15 @@ impl Modder {
             }
             ".lq.Lobby.receiveCharacterRewards" => {
                 fake = true;
+            }
+            ".lq.FastTest.broadcastInGame" => {
+                // In-game emoji are sent as a JSON broadcast such as {"emo":3}.
+                let msg = lq::ReqBroadcastInGame::decode(msg_block.data.as_ref())?;
+                let content = &msg.content;
+                tracing::debug!(
+                    target: RESOURCE_TARGET,
+                    "发送对局广播（表情）：{content}"
+                );
             }
             ".lq.Lobby.setRandomCharacter" => {
                 fake = true;
@@ -656,6 +729,14 @@ impl Modder {
                     }
                 }
             }
+            ".lq.NotifyGameBroadcast" => {
+                let msg = lq::NotifyGameBroadcast::decode(msg_block.data.as_ref())?;
+                let (seat, content) = (msg.seat, &msg.content);
+                tracing::debug!(
+                    target: RESOURCE_TARGET,
+                    "收到座位 {seat} 的对局广播（表情）：{content}"
+                );
+            }
             _ => {}
         }
         let msg = match modified_data {
@@ -674,6 +755,15 @@ fn envelope(header: &[u8], msg_block: &BaseMessage) -> Bytes {
     buf.extend_from_slice(header);
     let _ = msg_block.encode(&mut buf);
     buf.into()
+}
+
+/// 以 `槽位:道具ID` 列出装扮，供调试日志使用。
+fn describe_views(views: &[lq::ViewSlot]) -> String {
+    views
+        .iter()
+        .map(|view| format!("{}:{}", view.slot, view.item_id))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn add_zone_id(id: u32, name: &str) -> String {

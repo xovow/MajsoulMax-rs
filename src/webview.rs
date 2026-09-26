@@ -590,6 +590,7 @@ fn load_initial_values(settings: &Settings) -> InitialValues {
         anti_nickname_censorship: mod_json["antiNicknameCensorship"].as_bool().unwrap_or(true),
         emoji_switch: mod_json["emojiSwitch"].as_bool().unwrap_or(false),
         hint_switch: mod_json["hintSwitch"].as_bool().unwrap_or(true),
+        debug_log: settings.debug_log_on(),
         req_proxy: settings.req_proxy().to_owned(),
         github_prefix: settings.github_prefix().to_owned(),
         liqi_version: settings.liqi_version().to_owned(),
@@ -620,6 +621,7 @@ fn live_mod_patch(change: SettingChange) -> Option<LiveModPatch> {
         }
         SettingChange::EmojiSwitch(value) => Some(LiveModPatch::EmojiSwitch(value)),
         SettingChange::HintSwitch(value) => Some(LiveModPatch::HintSwitch(value)),
+        SettingChange::DebugLog(_) => None,
         _ => None,
     }
 }
@@ -630,6 +632,7 @@ fn setting_applies_immediately(change: &SettingChange, mod_on: bool) -> bool {
         | SettingChange::GithubPrefix(_)
         | SettingChange::UpdateCheckMode(_)
         | SettingChange::UpdateIntervalMinutes(_) => true,
+        SettingChange::DebugLog(_) => false,
         SettingChange::Nickname(_)
         | SettingChange::ShowServer(_)
         | SettingChange::AntiNicknameCensorship(_)
@@ -651,6 +654,7 @@ fn apply_live_setting(settings: &mut Arc<Settings>, change: &SettingChange) {
         SettingChange::GithubPrefix(value) => {
             Arc::make_mut(settings).set_github_prefix(value.clone())
         }
+        SettingChange::DebugLog(value) => Arc::make_mut(settings).set_debug_log(*value),
         _ => {}
     }
 }
@@ -677,6 +681,7 @@ fn write_setting(config_dir: &Path, change: SettingChange) -> Result<()> {
             ("settings.mod.json", "emojiSwitch", Value::Bool(value))
         }
         SettingChange::HintSwitch(value) => ("settings.mod.json", "hintSwitch", Value::Bool(value)),
+        SettingChange::DebugLog(value) => ("settings.json", "debugLog", Value::Bool(value)),
         SettingChange::ReqProxy(value) => ("settings.json", "reqProxy", Value::String(value)),
         SettingChange::GithubPrefix(value) => {
             ("settings.json", "githubPrefix", Value::String(value))

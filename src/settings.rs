@@ -246,6 +246,8 @@ pub struct Settings {
     req_proxy: String,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     github_prefix: String,
+    #[serde(default)]
+    debug_log: bool,
     #[serde(skip)]
     dir: PathBuf,
 }
@@ -261,6 +263,7 @@ impl Default for Settings {
             github_token: String::new(),
             req_proxy: String::new(),
             github_prefix: String::new(),
+            debug_log: false,
             dir: PathBuf::new(),
         }
     }
@@ -300,6 +303,16 @@ impl Settings {
     }
     pub fn mod_on(&self) -> bool {
         self.mod_switch
+    }
+    pub fn debug_log_on(&self) -> bool {
+        self.debug_log
+    }
+    pub fn set_debug_log(&mut self, enabled: bool) {
+        self.debug_log = enabled;
+    }
+    /// 调试日志所在目录，开启 `debugLog` 后由代理写入。
+    pub fn debug_log_dir(&self) -> PathBuf {
+        self.dir.join("logs")
     }
     pub fn update_check_mode(&self) -> UpdateCheckMode {
         self.auto_update
@@ -713,6 +726,7 @@ mod tests {
             let settings: Settings = serde_json::from_value(document).unwrap();
             assert_eq!(settings.update_check_mode(), mode);
             assert_eq!(settings.update_interval_minutes(), 60);
+            assert!(!settings.debug_log_on());
         }
     }
 

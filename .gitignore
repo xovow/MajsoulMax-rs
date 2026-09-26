@@ -5,3 +5,4 @@
 .aider*
 .env
 liqi_config/gui-state.json
+liqi_config/logs/

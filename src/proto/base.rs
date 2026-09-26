@@ -9,3 +9,12 @@ pub struct BaseMessage {
     #[prost(bytes = "bytes", tag = "2")]
     pub data: ::bytes::Bytes,
 }
+
+// 绝大多数响应的 1 号字段都是 lq.Error。调试日志只解码这一个字段，
+// 以便统一记录服务器拒绝的请求；其余字段按未知字段跳过。
+// 调用方需确认目标响应类型的 1 号字段确实是 lq.Error。
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResponseError {
+    #[prost(message, optional, tag = "1")]
+    pub error: ::core::option::Option<super::lq::Error>,
+}

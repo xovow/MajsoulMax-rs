@@ -4,6 +4,7 @@ use hudsucker::{Proxy, certificate_authority::RcgenAuthority, rcgen::KeyPair, ru
 use std::{future::Future, net::SocketAddr, str::FromStr, sync::Arc};
 
 mod connections;
+mod debug_log;
 mod handler;
 mod modder;
 mod parser;
@@ -12,6 +13,7 @@ mod settings;
 mod update_schedule;
 
 pub use crate::{
+    debug_log::start as start_debug_log,
     modder::{Modder, SaveErrorHandler},
     settings::{
         LiqiUpdatePhase, LiqiUpdateStatus, LiveModPatch, MaxData, ModSettings, Settings,
@@ -21,6 +23,7 @@ pub use crate::{
 };
 pub use anyhow::Result;
 pub use tokio::sync::RwLock;
+pub use tracing_appender::non_blocking::WorkerGuard as DebugLogGuard;
 
 fn generate_ca() -> Result<RcgenAuthority> {
     const KEY_PAIR: &str = include_str!("./ca/hudsucker.key");

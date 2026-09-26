@@ -14,6 +14,16 @@ pub(crate) enum MessageKind {
     Response(u16),
 }
 
+impl std::fmt::Display for MessageKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Notify => f.write_str("通知"),
+            Self::Request(id) => write!(f, "请求#{id}"),
+            Self::Response(id) => write!(f, "响应#{id}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ParsedMessage {
     pub kind: MessageKind,

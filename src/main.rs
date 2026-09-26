@@ -38,6 +38,8 @@ fn run_application() -> Result<()> {
 
     let config_hint = Path::new("./liqi_config");
     let settings = Settings::load_config(config_hint)?;
+    // Keep the guard alive until exit: dropping it flushes the background writer.
+    let _debug_log = start_debug_log_if_enabled(&settings);
     let config_dir = settings.data_dir().to_path_buf();
     let proxy_addr = settings.proxy_addr.clone();
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -50,6 +52,27 @@ fn run_application() -> Result<()> {
         .block_on(manager_task)
         .context("Proxy manager panicked")?;
     webview_result
+}
+
+/// The debug log is only read at startup; toggling `debugLog` needs a restart.
+#[cfg(windows)]
+fn start_debug_log_if_enabled(settings: &Settings) -> Option<DebugLogGuard> {
+    if !settings.debug_log_on() {
+        return None;
+    }
+    let dir = settings.debug_log_dir();
+    match start_debug_log(&dir) {
+        Ok(guard) => {
+            let version = env!("CARGO_PKG_VERSION");
+            tracing::info!("MajsoulMax {version} 调试日志已开启：{}", dir.display());
+            Some(guard)
+        }
+        Err(error) => {
+            let message = format!("调试日志开启失败，程序将继续运行：{error:#}");
+            native_sidebar::show_error_dialog(&message);
+            None
+        }
+    }
 }
 
 #[cfg(windows)]

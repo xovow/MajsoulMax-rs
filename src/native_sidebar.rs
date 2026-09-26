@@ -62,6 +62,7 @@ const ID_CURRENT_VERSION: i32 = 1015;
 const ID_LATEST_VERSION: i32 = 1016;
 const ID_MESSAGE: i32 = 1017;
 const ID_UPDATE_INTERVAL: i32 = 1018;
+const ID_DEBUG_LOG: i32 = 1019;
 const TEXT_TIMER_ID: usize = 2001;
 // Resize the WebView2 surface at most once per display frame.  A raw
 // WM_MOUSEMOVE stream can be several times faster than the WebView2
@@ -75,19 +76,21 @@ const CHILD_WHEEL_SUBCLASS_ID: usize = 3;
 const SIDEBAR_CLASS: &str = "MajsoulMaxSidebar";
 static SIDEBAR_CLASS_NAME: OnceLock<Vec<u16>> = OnceLock::new();
 
-const TOGGLE_IDS: [i32; 5] = [
+const TOGGLE_IDS: [i32; 6] = [
     ID_MOD_SWITCH,
     ID_SHOW_SERVER,
     ID_ANTI_NICKNAME_CENSORSHIP,
     ID_EMOJI_SWITCH,
     ID_HINT_SWITCH,
+    ID_DEBUG_LOG,
 ];
-const TOGGLE_CHANGES: [fn(bool) -> SettingChange; 5] = [
+const TOGGLE_CHANGES: [fn(bool) -> SettingChange; 6] = [
     SettingChange::ModSwitch,
     SettingChange::ShowServer,
     SettingChange::AntiNicknameCensorship,
     SettingChange::EmojiSwitch,
     SettingChange::HintSwitch,
+    SettingChange::DebugLog,
 ];
 const TEXT_IDS: [i32; 4] = [
     ID_NICKNAME,
@@ -106,7 +109,7 @@ const UPDATE_MODES: [(UpdateCheckMode, &str); 3] = [
     (UpdateCheckMode::Periodic, "定时检查更新"),
     (UpdateCheckMode::Disabled, "关闭检查更新"),
 ];
-const RELOAD_LOCK_IDS: [i32; 12] = [
+const RELOAD_LOCK_IDS: [i32; 13] = [
     ID_MOD_SWITCH,
     ID_UPDATE_MODE,
     ID_UPDATE_INTERVAL,
@@ -117,6 +120,7 @@ const RELOAD_LOCK_IDS: [i32; 12] = [
     ID_ANTI_NICKNAME_CENSORSHIP,
     ID_EMOJI_SWITCH,
     ID_HINT_SWITCH,
+    ID_DEBUG_LOG,
     ID_CHECK_UPDATE,
     ID_RESTART,
 ];
@@ -131,6 +135,7 @@ pub enum SettingChange {
     AntiNicknameCensorship(bool),
     EmojiSwitch(bool),
     HintSwitch(bool),
+    DebugLog(bool),
     ReqProxy(String),
     GithubPrefix(String),
 }
@@ -161,6 +166,7 @@ pub struct InitialValues {
     pub anti_nickname_censorship: bool,
     pub emoji_switch: bool,
     pub hint_switch: bool,
+    pub debug_log: bool,
     pub req_proxy: String,
     pub github_prefix: String,
     pub liqi_version: String,
@@ -219,8 +225,8 @@ enum Row {
 struct CallbackContext {
     proxy: EventLoopProxy<GuiEvent>,
     scrollbar: HWND,
-    toggles: [AtomicBool; 5],
-    toggle_dirty: [AtomicBool; 5],
+    toggles: [AtomicBool; 6],
+    toggle_dirty: [AtomicBool; 6],
     text_dirty: [AtomicBool; 4],
     update_mode_dirty: AtomicBool,
     // `drag_active`/`drag_x` are updated by the splitter window procedure,
@@ -350,7 +356,8 @@ impl NativeSidebar {
         content.add_toggle(ID_SHOW_SERVER, "显示服务器", 12)?;
         content.add_toggle(ID_ANTI_NICKNAME_CENSORSHIP, "反昵称审查", 12)?;
         content.add_toggle(ID_EMOJI_SWITCH, "额外表情", 12)?;
-        content.add_toggle(ID_HINT_SWITCH, "王座便捷提示", 20)?;
+        content.add_toggle(ID_HINT_SWITCH, "王座便捷提示", 12)?;
+        content.add_toggle(ID_DEBUG_LOG, "调试日志（重启生效）", 20)?;
         content.add_heading("协议数据版本")?;
         content.add_band(
             &format!("当前：{}", initial.liqi_version),
@@ -370,7 +377,8 @@ impl NativeSidebar {
         )?;
         content.add_button(ID_CHECK_UPDATE, "检查更新", 16)?;
         content.add_band(
-            "设置修改后自动保存。检查方式和间隔立即生效；Mod 开关需重新加载。GitHub 代理、前缀和已开启的 Mod 项立即生效。",
+            "设置修改后自动保存。检查方式和间隔立即生效；Mod 开关需重新加载，调试日志需重启程序。\
+             GitHub 代理、前缀和已开启的 Mod 项立即生效。",
             0,
             normal_font,
             WidthKind::Content,
@@ -403,7 +411,7 @@ impl NativeSidebar {
             proxy,
             scrollbar,
             toggles: toggle_values(initial).map(AtomicBool::new),
-            toggle_dirty: [false; 5].map(AtomicBool::new),
+            toggle_dirty: [false; 6].map(AtomicBool::new),
             text_dirty: [false; 4].map(AtomicBool::new),
             update_mode_dirty: AtomicBool::new(false),
             drag_active: AtomicBool::new(false),
@@ -1152,13 +1160,14 @@ fn layout_row(row: &Row, y: i32, ctx: &FlowCtx, place: bool) -> i32 {
     }
 }
 
-fn toggle_values(values: &InitialValues) -> [bool; 5] {
+fn toggle_values(values: &InitialValues) -> [bool; 6] {
     [
         values.mod_switch,
         values.show_server,
         values.anti_nickname_censorship,
         values.emoji_switch,
         values.hint_switch,
+        values.debug_log,
     ]
 }
 

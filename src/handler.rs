@@ -1,24 +1,96 @@
 use anyhow::Result;
 use bytes::Bytes;
 use hudsucker::{
-    Body, HttpContext, HttpHandler, WebSocketContext, WebSocketHandler,
+    Body, HttpContext, HttpHandler, RequestOrResponse, WebSocketContext, WebSocketHandler,
     futures::{Sink, SinkExt, Stream, StreamExt},
-    hyper::Request,
+    hyper::{Method, Request, Response, StatusCode, Uri},
+    hyper_util::client::legacy::Error as ClientError,
     tokio_tungstenite::tungstenite::{self, Message},
 };
-use std::{future::pending, sync::Arc};
+use std::{future::pending, sync::Arc, time::Instant};
 use tokio::sync::mpsc;
 
 use crate::{
     connections::{ConnectionKey, ConnectionState, Connections},
     modder::Modder,
     parser::{MessageKind, ParsedMessage},
+    proto::base::ResponseError,
 };
+
+const RESOURCE_TARGET: &str = "majsoul_max_rs::resource";
+const HTTP_TARGET: &str = "majsoul_max_rs::http";
+const WEBSOCKET_TARGET: &str = "majsoul_max_rs::websocket";
+
+/// 调试日志逐条记录的协议方法：Mod 改写的角色、装扮、表情相关消息，
+/// 以及对局中的表情广播和动作（和牌、鸣牌、立直特效依赖玩家的装扮）。
+const RESOURCE_METHODS: &[&str] = &[
+    ".lq.Lobby.login",
+    ".lq.Lobby.oauth2Login",
+    ".lq.Lobby.fetchAccountInfo",
+    ".lq.Lobby.fetchInfo",
+    ".lq.Lobby.fetchCharacterInfo",
+    ".lq.Lobby.fetchBagInfo",
+    ".lq.Lobby.fetchAllCommonViews",
+    ".lq.Lobby.fetchCommonViews",
+    ".lq.Lobby.saveCommonViews",
+    ".lq.Lobby.useCommonView",
+    ".lq.Lobby.changeMainCharacter",
+    ".lq.Lobby.changeCharacterSkin",
+    ".lq.Lobby.updateCharacterSort",
+    ".lq.Lobby.useTitle",
+    ".lq.Lobby.setLoadingImage",
+    ".lq.Lobby.fetchTitleList",
+    ".lq.Lobby.receiveCharacterRewards",
+    ".lq.Lobby.addFinishedEnding",
+    ".lq.Lobby.setRandomCharacter",
+    ".lq.Lobby.fetchRandomCharacter",
+    ".lq.Lobby.setHiddenCharacter",
+    ".lq.Lobby.createRoom",
+    ".lq.Lobby.fetchRoom",
+    ".lq.FastTest.authGame",
+    ".lq.FastTest.enterGame",
+    ".lq.FastTest.syncGame",
+    ".lq.FastTest.broadcastInGame",
+    ".lq.NotifyAccountUpdate",
+    ".lq.NotifyRoomPlayerUpdate",
+    ".lq.NotifyGameBroadcast",
+];
+
+/// 这些响应的 1 号字段不是 lq.Error，不能用 [`ResponseError`] 探测。
+const RESPONSES_WITHOUT_ERROR: &[&str] = &[
+    ".lq.Lobby.fetchAllCommonViews",
+    ".lq.Lobby.fetchCommonViews",
+];
 
 #[derive(Clone)]
 pub struct Handler {
     modder: Option<Arc<Modder>>,
     connections: Arc<Connections>,
+    /// hudsucker 用同一个实例处理一对 HTTP 请求与响应，这里暂存请求信息供日志使用。
+    http_request: Option<HttpRequestInfo>,
+}
+
+#[derive(Clone)]
+struct HttpRequestInfo {
+    method: Method,
+    uri: Uri,
+    started: Instant,
+}
+
+impl HttpRequestInfo {
+    /// 只记录失败的响应；成功的静态资源请求数量大且无排查价值。
+    fn log_response(&self, status: StatusCode) {
+        if !(status.is_client_error() || status.is_server_error()) {
+            return;
+        }
+        let Self {
+            method,
+            uri,
+            started,
+        } = self;
+        let elapsed = started.elapsed().as_millis();
+        tracing::warn!(target: HTTP_TARGET, "{status} {method} {uri} ({elapsed} ms)");
+    }
 }
 
 struct ForwarderGuard(Arc<ConnectionState>);
@@ -34,6 +106,7 @@ impl Handler {
         Self {
             modder,
             connections: Arc::new(Connections::default()),
+            http_request: None,
         }
     }
 
@@ -69,7 +142,12 @@ impl Handler {
                         message = stream.next() => {
                             match message {
                                 Some(Ok(message)) => message,
-                                Some(Err(_)) => {
+                                Some(Err(error)) => {
+                                    let dir = direction(from_client);
+                                    tracing::warn!(
+                                        target: WEBSOCKET_TARGET,
+                                        "{dir} 读取失败，断开连接：{error}"
+                                    );
                                     send_message(&mut sink, Message::Close(None)).await;
                                     break;
                                 }
@@ -120,38 +198,155 @@ impl Handler {
         let Message::Binary(buf) = msg else {
             return Some(msg);
         };
-        let Ok(parsed) = ParsedMessage::decode(&buf, from_client) else {
-            return Some(Message::Binary(buf));
+        let dir = direction(from_client);
+        let parsed = match ParsedMessage::decode(&buf, from_client) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let len = buf.len();
+                tracing::debug!(
+                    target: RESOURCE_TARGET,
+                    "{dir} 无法解析的帧（{len} 字节），原样转发：{error}"
+                );
+                return Some(Message::Binary(buf));
+            }
         };
         let kind = parsed.kind;
-        let response_method = match kind {
+        let method_name = match kind {
             MessageKind::Request(id) => {
                 // Keep the original method even when the modder substitutes loginBeat.
                 connection.track_request(id, parsed.envelope.method_name.clone());
-                None
+                parsed.envelope.method_name.clone()
             }
             MessageKind::Response(id) => match connection.take_request(id) {
-                Some(method) => Some(method),
-                None => return Some(Message::Binary(buf)),
+                Some(method) => method,
+                None => {
+                    tracing::warn!(
+                        target: RESOURCE_TARGET,
+                        "{dir} {kind} 找不到对应的请求，未改写直接转发"
+                    );
+                    return Some(Message::Binary(buf));
+                }
             },
-            MessageKind::Notify => None,
+            MessageKind::Notify => parsed.envelope.method_name.clone(),
         };
+        let logged = is_resource_method(&method_name);
+        if logged && matches!(kind, MessageKind::Response(_)) {
+            log_response_error(&method_name, kind, &parsed.envelope.data);
+        }
         let res = modder
-            .modify_parsed(buf, response_method.as_deref().unwrap_or_default(), parsed)
+            .modify_parsed(buf.clone(), &method_name, parsed)
             .await;
+        // 原样转发的消息不记录，只留下 Mod 实际改写或拦截的。
+        let outcome = match &res.msg {
+            None => Some("已拦截，不转发"),
+            Some(out) if *out == buf => None,
+            Some(_) => Some("已改写后转发"),
+        };
+        if logged && let Some(outcome) = outcome {
+            tracing::debug!(target: RESOURCE_TARGET, "{dir} {kind} {method_name}：{outcome}");
+        }
         if res.msg.is_none()
             && let MessageKind::Request(id) = kind
         {
             let _ = connection.take_request(id);
         }
-        if let Some(injected) = res.inject_msg {
-            let _ = connection.injection_tx.send(injected).await;
+        if let Some(injected) = res.inject_msg
+            && connection.injection_tx.send(injected).await.is_err()
+        {
+            tracing::warn!(target: RESOURCE_TARGET, "{method_name} 的注入通知发送失败：连接已关闭");
         }
         res.msg.map(Message::Binary)
     }
 }
 
+fn is_resource_method(method_name: &str) -> bool {
+    RESOURCE_METHODS.contains(&method_name)
+}
+
+/// 记录服务器对资源相关请求返回的错误码，例如使用未拥有的角色表情被拒绝。
+fn log_response_error(method_name: &str, kind: MessageKind, data: &Bytes) {
+    if RESPONSES_WITHOUT_ERROR.contains(&method_name) {
+        return;
+    }
+    let error = <ResponseError as prost::Message>::decode(data.clone())
+        .ok()
+        .and_then(|response| response.error)
+        .filter(|error| error.code != 0);
+    if let Some(error) = error {
+        let code = error.code;
+        let message = &error.message;
+        tracing::warn!(
+            target: RESOURCE_TARGET,
+            "{kind} {method_name} 服务器返回错误 code={code} {message}"
+        );
+    }
+}
+
+fn direction(from_client: bool) -> &'static str {
+    if from_client {
+        "[客户端→服务器]"
+    } else {
+        "[服务器→客户端]"
+    }
+}
+
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str("：");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
 impl HttpHandler for Handler {
+    fn handle_request(
+        &mut self,
+        _ctx: &HttpContext,
+        req: Request<Body>,
+    ) -> impl Future<Output = RequestOrResponse> + Send {
+        // CONNECT 只建立隧道，里面的每个请求会再单独经过这里。
+        if req.method() != Method::CONNECT {
+            self.http_request = Some(HttpRequestInfo {
+                method: req.method().clone(),
+                uri: req.uri().clone(),
+                started: Instant::now(),
+            });
+        }
+        async move { req.into() }
+    }
+
+    fn handle_response(
+        &mut self,
+        _ctx: &HttpContext,
+        res: Response<Body>,
+    ) -> impl Future<Output = Response<Body>> + Send {
+        if let Some(request) = self.http_request.take() {
+            request.log_response(res.status());
+        }
+        async move { res }
+    }
+
+    /// Keep hudsucker's default 502 response, but record why forwarding failed.
+    fn handle_error(
+        &mut self,
+        _ctx: &HttpContext,
+        err: ClientError,
+    ) -> impl Future<Output = Response<Body>> + Send {
+        let reason = error_chain(&err);
+        match self.http_request.take() {
+            Some(HttpRequestInfo { method, uri, .. }) => {
+                tracing::error!(target: HTTP_TARGET, "请求转发失败 {method} {uri}：{reason}");
+            }
+            None => tracing::error!(target: HTTP_TARGET, "请求转发失败：{reason}"),
+        }
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::BAD_GATEWAY;
+        async move { response }
+    }
+
     /// With Mod off nothing is rewritten, so tunnel CONNECT requests unchanged
     /// instead of paying for TLS interception on every page asset.
     fn should_intercept_connect(
@@ -172,6 +367,9 @@ impl WebSocketHandler for Handler {
         sink: impl Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static,
     ) -> impl Future<Output = ()> + Send {
         let from_client = matches!(ctx, WebSocketContext::ClientToServer { .. });
+        if let WebSocketContext::ClientToServer { dst, .. } = &ctx {
+            tracing::debug!(target: WEBSOCKET_TARGET, "已连接 {dst}");
+        }
         let key = ConnectionKey::from_context(&ctx);
         let connection = if self.modder.is_some() && !key.is_observer() {
             Some(self.connections.get(key, from_client))
@@ -434,5 +632,58 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         assert!(weak.upgrade().is_none());
         assert!(sender.is_closed());
+    }
+
+    /// 调试日志应记录资源相关消息的改写结果，以及服务器返回的错误码。
+    #[tokio::test]
+    async fn debug_log_records_resource_messages_and_server_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "majsoul-max-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let guard = crate::debug_log::start(&dir).unwrap();
+        let handler = handler();
+        let connection = connection(&handler, 10_003);
+
+        handler
+            .modify_message(
+                true,
+                frame(2, 1, ".lq.Lobby.changeMainCharacter", vec![]),
+                Some(&connection),
+            )
+            .await;
+
+        let rejected = lq::ResCommon {
+            error: Some(lq::Error {
+                code: 1203,
+                message: "未拥有该表情".into(),
+                ..Default::default()
+            }),
+        };
+        handler
+            .modify_message(
+                false,
+                frame(3, 1, "", rejected.encode_to_vec()),
+                Some(&connection),
+            )
+            .await;
+
+        drop(guard);
+        let log = std::fs::read_dir(&dir)
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.ok()?.path();
+                path.extension()?.eq("log").then_some(path)
+            })
+            .expect("应生成日志文件");
+        let content = std::fs::read_to_string(&log).unwrap();
+        assert!(content.contains("changeMainCharacter"), "{content}");
+        assert!(content.contains("code=1203"), "{content}");
+        assert!(content.contains("未拥有该表情"), "{content}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

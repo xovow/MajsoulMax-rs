@@ -30,8 +30,13 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # derive/std 原先靠其他依赖的特性合并偶然带入，显式声明避免依赖树一变就炸
 serde = { version = "1", features = ["derive", "std"], default-features = false }
 tokio = { version = "1", features = ["fs", "net", "rt-multi-thread", "sync", "time"] }
-# 仅用于在编译期关闭代理依赖中的 tracing 调用，不安装日志订阅器。
-tracing = { version = "0.1", features = ["max_level_off"], default-features = false }
+# 调试日志（settings.json 的 debugLog）通过 tracing 写文件。编译期上限为 debug，
+# 运行时再由过滤器决定：本 crate 记 debug，代理依赖（hudsucker 等）只记 warn/error。
+# 未开启调试日志时不安装订阅器，每个调用点只剩一次原子读取。
+tracing = { version = "0.1", features = ["max_level_debug", "release_max_level_debug", "std"], default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"], default-features = false }
+tracing-appender = { version = "0.2", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 prost = { version = "0.14", default-features = false }
 hudsucker = { version = "0.25", features = [
     "rcgen-ca",
