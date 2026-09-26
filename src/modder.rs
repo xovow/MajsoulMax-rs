@@ -22,6 +22,8 @@ struct Safe {
     characters: Vec<lq::Character>,
     main_character_id: u32,
     items: Vec<lq::Item>,
+    /// 当前对局中服务器登记的本人角色（未经 Mod 改写），0 表示未知。
+    game_character_id: u32,
 }
 
 #[derive(Default)]
@@ -208,6 +210,18 @@ impl Modder {
                     }
                 }
                 let account_id = self.safe.read().await.account_id;
+                // 必须在 change_player 改写之前读取，服务器按这个角色校验表情。
+                let game_character_id = msg
+                    .players
+                    .iter()
+                    .find(|p| p.account_id == account_id)
+                    .and_then(|p| p.character.as_ref())
+                    .map_or(0, |c| c.charid);
+                self.safe.write().await.game_character_id = game_character_id;
+                tracing::debug!(
+                    target: RESOURCE_TARGET,
+                    "本局服务器登记的本人角色：{game_character_id}"
+                );
                 if tracing::enabled!(target: RESOURCE_TARGET, tracing::Level::WARN)
                     && !msg.players.iter().any(|p| p.account_id == account_id)
                 {
@@ -482,6 +496,7 @@ impl Modder {
 
     async fn modify_req(&self, buf: Bytes, mut msg_block: BaseMessage) -> Result<ModifyResult> {
         let mut fake = false;
+        let mut rewritten = false;
         let method_name = &msg_block.method_name;
         let mut inject_msg: Option<Bytes> = None;
         match method_name.as_str() {
@@ -596,13 +611,25 @@ impl Modder {
                 fake = true;
             }
             ".lq.FastTest.broadcastInGame" => {
-                // In-game emoji are sent as a JSON broadcast such as {"emo":3}.
-                let msg = lq::ReqBroadcastInGame::decode(msg_block.data.as_ref())?;
-                let content = &msg.content;
+                // In-game emoji are sent as a JSON broadcast such as {"emo_id":1240005}.
+                let mut msg = lq::ReqBroadcastInGame::decode(msg_block.data.as_ref())?;
                 tracing::debug!(
                     target: RESOURCE_TARGET,
-                    "发送对局广播（表情）：{content}"
+                    "发送对局广播（表情）：{} except_self={}",
+                    msg.content,
+                    msg.except_self
                 );
+                // 服务器只认它登记的角色，把 Mod 角色的第 n 个表情换成登记角色的第 n 个。
+                let game_character_id = self.safe.read().await.game_character_id;
+                if let Some(content) = remap_emoji_content(&msg.content, game_character_id) {
+                    tracing::debug!(
+                        target: RESOURCE_TARGET,
+                        "表情改写为登记角色 {game_character_id}：{content}"
+                    );
+                    msg.content = content;
+                    msg_block.data = msg.encode_to_vec().into();
+                    rewritten = true;
+                }
             }
             ".lq.Lobby.setRandomCharacter" => {
                 fake = true;
@@ -625,13 +652,15 @@ impl Modder {
             }
             _ => {}
         }
-        let msg = if fake {
+        if fake {
             msg_block.method_name = ".lq.Lobby.loginBeat".to_string();
             msg_block.data = lq::ReqLoginBeat {
                 contract: self.contract.read().await.clone(),
             }
             .encode_to_vec()
             .into();
+        }
+        let msg = if fake || rewritten {
             envelope(&buf[..HEADER_LEN], &msg_block)
         } else {
             buf
@@ -743,6 +772,30 @@ fn describe_views(views: &[lq::ViewSlot]) -> String {
         .map(|view| format!("{}:{}", view.slot, view.item_id))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// 角色 ID 有两种编码：序号 1..=99 为 `200000 + 序号`，100 起为 `20000000 + 序号`。
+fn character_index(character_id: u32) -> Option<u32> {
+    match character_id {
+        200_001..=299_999 => Some(character_id - 200_000),
+        20_000_100..=29_999_999 => Some(character_id - 20_000_000),
+        _ => None,
+    }
+}
+
+/// 表情 ID 编码为 `角色序号 * 10000 + 表情序号`。
+/// 把广播中的表情换成 `character_id` 的同序号表情；无需改写时返回 `None`。
+fn remap_emoji_content(content: &str, character_id: u32) -> Option<String> {
+    const EMOJI_STRIDE: u64 = 10_000;
+    let index = u64::from(character_index(character_id)?);
+    let mut json: serde_json::Value = serde_json::from_str(content).ok()?;
+    let emo_id = json.get("emo_id")?.as_u64()?;
+    let remapped = index * EMOJI_STRIDE + emo_id % EMOJI_STRIDE;
+    if remapped == emo_id {
+        return None;
+    }
+    json["emo_id"] = remapped.into();
+    serde_json::to_string(&json).ok()
 }
 
 fn add_zone_id(id: u32, name: &str) -> String {
