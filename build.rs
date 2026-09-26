@@ -1,4 +1,4 @@
-use std::{fs, io::Result};
+use std::{collections::HashSet, fs, io::Result, path::PathBuf};
 
 use prost::Message;
 use prost_types::FileDescriptorSet;
@@ -14,6 +14,37 @@ fn main() -> Result<()> {
     descriptor_set
         .file
         .retain(|file| file.package.as_deref() == Some("lq"));
+
+    // Only probe responses whose field 1 is actually lq.Error. A blanket decoder
+    // can mistake ordinary nested messages for errors (e.g. common views).
+    let error_responses: HashSet<_> = descriptor_set
+        .file
+        .iter()
+        .flat_map(|file| &file.message_type)
+        .filter(|message| {
+            message.field.iter().any(|field| {
+                field.number == Some(1) && field.type_name.as_deref() == Some(".lq.Error")
+            })
+        })
+        .map(|message| format!(".lq.{}", message.name()))
+        .collect();
+    let mut error_methods = Vec::new();
+    for file in &descriptor_set.file {
+        for service in &file.service {
+            for method in &service.method {
+                if error_responses.contains(method.output_type()) {
+                    error_methods.push(format!(".lq.{}.{}", service.name(), method.name()));
+                }
+            }
+        }
+    }
+    error_methods.sort();
+    error_methods.dedup();
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
+    fs::write(
+        out_dir.join("error_response_methods.rs"),
+        format!("const ERROR_RESPONSE_METHODS: &[&str] = &{error_methods:?};\n"),
+    )?;
 
     let mut config = prost_build::Config::new();
     config

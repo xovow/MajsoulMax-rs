@@ -35,6 +35,18 @@ impl ConnectionKey {
     }
 }
 
+impl std::fmt::Display for ConnectionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} -> {}{}",
+            self.client_addr,
+            self.server_uri.authority().map_or("", |host| host.as_str()),
+            self.server_uri.path()
+        )
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Connections {
     states: Mutex<HashMap<ConnectionKey, ConnectionEntry>>,
@@ -97,6 +109,10 @@ pub(crate) struct ConnectionState {
 }
 
 impl ConnectionState {
+    pub fn key(&self) -> &ConnectionKey {
+        &self.key
+    }
+
     pub fn track_request(&self, id: u16, method_name: String) {
         self.pending_requests
             .lock()

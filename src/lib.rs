@@ -4,6 +4,7 @@ use hudsucker::{Proxy, certificate_authority::RcgenAuthority, rcgen::KeyPair, ru
 use std::{future::Future, net::SocketAddr, str::FromStr, sync::Arc};
 
 mod connections;
+mod debug_log;
 mod handler;
 mod modder;
 mod parser;
@@ -12,6 +13,7 @@ mod settings;
 mod update_schedule;
 
 pub use crate::{
+    debug_log::DebugLog,
     modder::{Modder, SaveErrorHandler},
     settings::{
         LiqiUpdatePhase, LiqiUpdateStatus, LiveModPatch, MaxData, ModSettings, Settings,

@@ -246,6 +246,8 @@ pub struct Settings {
     req_proxy: String,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     github_prefix: String,
+    #[serde(default)]
+    debug_log: bool,
     #[serde(skip)]
     dir: PathBuf,
 }
@@ -261,6 +263,7 @@ impl Default for Settings {
             github_token: String::new(),
             req_proxy: String::new(),
             github_prefix: String::new(),
+            debug_log: false,
             dir: PathBuf::new(),
         }
     }
@@ -300,6 +303,16 @@ impl Settings {
     }
     pub fn mod_on(&self) -> bool {
         self.mod_switch
+    }
+    pub fn debug_log_on(&self) -> bool {
+        self.debug_log
+    }
+    pub fn set_debug_log(&mut self, enabled: bool) {
+        self.debug_log = enabled;
+    }
+    /// 相对于工作目录，与配置目录独立；开启 `debugLog` 后仅写入错误。
+    pub fn debug_log_dir(&self) -> PathBuf {
+        PathBuf::from("./log")
     }
     pub fn update_check_mode(&self) -> UpdateCheckMode {
         self.auto_update
@@ -375,7 +388,16 @@ impl Settings {
         match self.update_with_progress(&mut on_progress).await {
             Ok(Some(version)) => LiqiUpdateStatus::Updated(version),
             Ok(None) => LiqiUpdateStatus::Latest(self.liqi_version.clone()),
-            Err(error) => LiqiUpdateStatus::Failed(error.to_string()),
+            Err(error) => {
+                tracing::error!(
+                    target: "majsoul_max_rs::update",
+                    config_dir = %self.dir.display(),
+                    current_version = %self.liqi_version,
+                    error = %format_args!("{error:#}"),
+                    "协议数据检查或下载失败"
+                );
+                LiqiUpdateStatus::Failed(format!("{error:#}"))
+            }
         }
     }
 

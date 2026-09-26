@@ -3,7 +3,7 @@ use crate::native_sidebar::{
 };
 use anyhow::{Context, Result};
 use majsoul_max_rs::{
-    LiqiUpdateStatus, LiveModPatch, SaveErrorHandler, Settings, UpdateCheckMode,
+    DebugLog, LiqiUpdateStatus, LiveModPatch, SaveErrorHandler, Settings, UpdateCheckMode,
     UpdateCheckSchedule, read_settings_file, write_json_setting,
 };
 use serde::{Deserialize, Serialize};
@@ -100,6 +100,7 @@ pub fn run(
     proxy_addr: &str,
     settings: Arc<Settings>,
     proxy_commands: UnboundedSender<ProxyCommand>,
+    debug_log: Arc<DebugLog>,
 ) -> Result<()> {
     let config_dir = settings.data_dir().to_path_buf();
     let state_path = config_dir.join(GUI_STATE_FILE);
@@ -143,6 +144,7 @@ pub fn run(
         event_proxy,
         runtime: tokio::runtime::Handle::current(),
         proxy_commands,
+        debug_log,
         proxy_addr: proxy_addr.to_owned(),
         config_dir,
         state_path,
@@ -171,6 +173,7 @@ struct App {
     event_proxy: EventLoopProxy<GuiEvent>,
     runtime: tokio::runtime::Handle,
     proxy_commands: UnboundedSender<ProxyCommand>,
+    debug_log: Arc<DebugLog>,
     proxy_addr: String,
     config_dir: PathBuf,
     state_path: PathBuf,
@@ -416,7 +419,7 @@ impl App {
     fn on_proxy_reloaded(&mut self, result: std::result::Result<ReloadedSettings, String>) {
         self.reloading_proxy = false;
         self.sidebar.set_reloading(false);
-        let reloaded = match result {
+        let mut reloaded = match result {
             Ok(reloaded) => reloaded,
             Err(error) => {
                 if let Some(status) = self.last_update_status.as_ref() {
@@ -428,6 +431,13 @@ impl App {
             }
         };
 
+        let log_error = self
+            .debug_log
+            .set_enabled(reloaded.settings.debug_log_on())
+            .err();
+        if log_error.is_some() {
+            Arc::make_mut(&mut reloaded.settings).set_debug_log(self.debug_log.is_enabled());
+        }
         let values = load_initial_values(reloaded.settings.as_ref());
         self.sidebar.apply_values(&values);
         if let Some(status) = self.last_update_status.take() {
@@ -460,6 +470,10 @@ impl App {
         }
         if let Err(error) = layout {
             self.sidebar.set_message(&format!("界面布局失败：{error}"));
+        }
+        if let Some(error) = log_error {
+            self.sidebar
+                .set_message(&format!("配置已重载，但调试日志切换失败：{error:#}"));
         }
     }
 
@@ -528,6 +542,7 @@ impl App {
                 &self.config_dir,
                 &mut self.settings,
                 &self.proxy_commands,
+                &self.debug_log,
                 change.clone(),
             )?;
             self.sidebar.mark_saved(&change);
@@ -614,6 +629,7 @@ fn load_initial_values(settings: &Settings) -> InitialValues {
         anti_nickname_censorship: mod_json["antiNicknameCensorship"].as_bool().unwrap_or(true),
         emoji_switch: mod_json["emojiSwitch"].as_bool().unwrap_or(false),
         hint_switch: mod_json["hintSwitch"].as_bool().unwrap_or(true),
+        debug_log: settings.debug_log_on(),
         req_proxy: settings.req_proxy().to_owned(),
         github_prefix: settings.github_prefix().to_owned(),
         liqi_version: settings.liqi_version().to_owned(),
@@ -624,9 +640,20 @@ fn persist_setting_change(
     config_dir: &Path,
     current_settings: &mut Arc<Settings>,
     proxy_commands: &UnboundedSender<ProxyCommand>,
+    debug_log: &DebugLog,
     change: SettingChange,
 ) -> Result<bool> {
     write_setting(config_dir, change.clone())?;
+    if let SettingChange::DebugLog(enabled) = &change
+        && let Err(error) = debug_log.set_enabled(*enabled)
+    {
+        write_setting(
+            config_dir,
+            SettingChange::DebugLog(current_settings.debug_log_on()),
+        )
+        .with_context(|| format!("切换调试日志失败（{error:#}），且无法恢复原设置"))?;
+        return Err(error);
+    }
     apply_live_setting(current_settings, &change);
     let immediate = setting_applies_immediately(&change, current_settings.mod_on());
     if let Some(patch) = live_mod_patch(change) {
@@ -644,6 +671,7 @@ fn live_mod_patch(change: SettingChange) -> Option<LiveModPatch> {
         }
         SettingChange::EmojiSwitch(value) => Some(LiveModPatch::EmojiSwitch(value)),
         SettingChange::HintSwitch(value) => Some(LiveModPatch::HintSwitch(value)),
+        SettingChange::DebugLog(_) => None,
         _ => None,
     }
 }
@@ -653,7 +681,8 @@ fn setting_applies_immediately(change: &SettingChange, mod_on: bool) -> bool {
         SettingChange::ReqProxy(_)
         | SettingChange::GithubPrefix(_)
         | SettingChange::UpdateCheckMode(_)
-        | SettingChange::UpdateIntervalMinutes(_) => true,
+        | SettingChange::UpdateIntervalMinutes(_)
+        | SettingChange::DebugLog(_) => true,
         SettingChange::Nickname(_)
         | SettingChange::ShowServer(_)
         | SettingChange::AntiNicknameCensorship(_)
@@ -675,6 +704,7 @@ fn apply_live_setting(settings: &mut Arc<Settings>, change: &SettingChange) {
         SettingChange::GithubPrefix(value) => {
             Arc::make_mut(settings).set_github_prefix(value.clone())
         }
+        SettingChange::DebugLog(value) => Arc::make_mut(settings).set_debug_log(*value),
         _ => {}
     }
 }
@@ -701,12 +731,22 @@ fn write_setting(config_dir: &Path, change: SettingChange) -> Result<()> {
             ("settings.mod.json", "emojiSwitch", Value::Bool(value))
         }
         SettingChange::HintSwitch(value) => ("settings.mod.json", "hintSwitch", Value::Bool(value)),
+        SettingChange::DebugLog(value) => ("settings.json", "debugLog", Value::Bool(value)),
         SettingChange::ReqProxy(value) => ("settings.json", "reqProxy", Value::String(value)),
         SettingChange::GithubPrefix(value) => {
             ("settings.json", "githubPrefix", Value::String(value))
         }
     };
-    write_json_setting(&config_dir.join(file_name), key, value)
+    write_json_setting(&config_dir.join(file_name), key, value).inspect_err(|error| {
+        tracing::error!(
+            target: "majsoul_max_rs::settings",
+            config_dir = %config_dir.display(),
+            file_name,
+            key,
+            error = %format_args!("{error:#}"),
+            "侧边栏设置保存失败"
+        );
+    })
 }
 
 fn load_gui_state(path: &Path) -> GuiState {
@@ -721,6 +761,13 @@ fn save_gui_state(path: &Path, state: &GuiState) -> Result<()> {
     let content = serde_json::to_string_pretty(state)?;
     fs::write(path, format!("{content}\n"))
         .with_context(|| format!("无法写入窗口状态 {}", path.display()))
+        .inspect_err(|error| {
+            tracing::error!(
+                target: "majsoul_max_rs::settings",
+                error = %format_args!("{error:#}"),
+                "窗口状态保存失败"
+            );
+        })
 }
 
 /// Remember that an update check started, so later launches and the hourly

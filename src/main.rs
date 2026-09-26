@@ -37,18 +37,36 @@ fn run_application() -> Result<()> {
     let _guard = runtime.enter();
 
     let config_hint = Path::new("./liqi_config");
-    let settings = Settings::load_config(config_hint)?;
+    let mut settings = Settings::load_config(config_hint)?;
+    let debug_log = Arc::new(DebugLog::new(&settings.debug_log_dir())?);
+    if let Err(error) = debug_log.set_enabled(settings.debug_log_on()) {
+        native_sidebar::show_error_dialog(&format!("调试日志开启失败：{error:#}"));
+        settings.set_debug_log(false);
+    }
     let config_dir = settings.data_dir().to_path_buf();
     let proxy_addr = settings.proxy_addr.clone();
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
     let manager_task = runtime.spawn(proxy_manager(config_dir, proxy_addr.clone(), command_rx));
 
-    let webview_result = webview::run(&proxy_addr, Arc::new(settings), command_tx.clone());
+    let webview_result = webview::run(
+        &proxy_addr,
+        Arc::new(settings),
+        command_tx.clone(),
+        Arc::clone(&debug_log),
+    );
 
     let _ = command_tx.send(ProxyCommand::Shutdown);
-    runtime
+    let manager_result = runtime
         .block_on(manager_task)
-        .context("Proxy manager panicked")?;
+        .context("Proxy manager panicked");
+    // 先记录再返回，保证错误写入发生在日志 guard 被释放之前。
+    if let Err(error) = &manager_result {
+        tracing::error!(error = %format_args!("{error:#}"), "代理管理器退出失败");
+    }
+    if let Err(error) = &webview_result {
+        tracing::error!(error = %format_args!("{error:#}"), "应用窗口运行失败");
+    }
+    manager_result?;
     webview_result
 }
 
@@ -65,12 +83,19 @@ impl RunningProxy {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        if tokio::time::timeout(Duration::from_secs(2), &mut self.task)
-            .await
-            .is_err()
-        {
-            self.task.abort();
-            let _ = self.task.await;
+        match tokio::time::timeout(Duration::from_secs(2), &mut self.task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                tracing::error!(error = %format_args!("{error:#}"), "代理运行失败");
+            }
+            Ok(Err(error)) => {
+                tracing::error!(%error, "代理任务异常结束");
+            }
+            Err(error) => {
+                tracing::error!(%error, "停止代理超时，将中止任务");
+                self.task.abort();
+                let _ = self.task.await;
+            }
         }
     }
 }
@@ -98,9 +123,15 @@ async fn start_proxy(settings: Arc<Settings>, modder: Option<Arc<Modder>>) -> Re
     let proxy_addr = settings.proxy_addr.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let running_modder = modder.clone();
-    let mut task = tokio::spawn(build_and_start_proxy(settings, modder, async move {
-        let _ = shutdown_rx.await;
-    }));
+    let mut task = tokio::spawn(async move {
+        build_and_start_proxy(settings, modder, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .inspect_err(|error| {
+            tracing::error!(error = %format_args!("{error:#}"), "代理任务运行失败");
+        })
+    });
 
     tokio::select! {
         biased;
@@ -143,7 +174,15 @@ async fn proxy_manager(
                     save_error_handler,
                 )
                 .await
-                .map_err(|error| format!("{error:#}"));
+                .map_err(|error| {
+                    tracing::error!(
+                        config_dir = %config_dir.display(),
+                        proxy_addr = %browser_proxy_addr,
+                        error = %format_args!("{error:#}"),
+                        "加载代理失败"
+                    );
+                    format!("{error:#}")
+                });
                 let _ = response.send(result);
             }
             ProxyCommand::ApplyModPatch(patch) => {
@@ -182,13 +221,25 @@ async fn reload_proxy(
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        let _ = wait_for_proxy_stop(browser_proxy_addr).await;
+        if let Err(error) = wait_for_proxy_stop(browser_proxy_addr).await {
+            tracing::error!(
+                proxy_addr = %browser_proxy_addr,
+                error = %format_args!("{error:#}"),
+                "等待旧代理释放端口失败"
+            );
+        }
         match start_proxy(Arc::clone(&settings), modder.clone()).await {
             Ok(replacement) => {
                 *running = Some(replacement);
                 return Ok(ReloadedSettings { settings });
             }
             Err(error) => {
+                tracing::error!(
+                    attempt = attempt + 1,
+                    proxy_addr = %browser_proxy_addr,
+                    error = %format_args!("{error:#}"),
+                    "启动代理失败"
+                );
                 last_error = Some(error);
             }
         }
