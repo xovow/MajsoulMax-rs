@@ -90,6 +90,10 @@ impl Modder {
         self.persist_settings(&settings);
     }
 
+    pub(crate) async fn yiman_effect_on(&self) -> bool {
+        self.mod_settings.read().await.yiman_effect_on()
+    }
+
     #[cfg(test)]
     pub async fn modify(
         &self,

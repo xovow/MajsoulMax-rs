@@ -63,6 +63,7 @@ To toggle Mod, edit `modSwitch` in `./liqi_config/settings.json`.
 -   Unlock all characters and skins
 -   Unlock all decorations
 -   Unlock all voices (callouts)
+-   Unlock yakuman animations in the web client
 -   Unlock all titles
 -   Unlock all loading CGs
 -   Unlock all emojis (not recommended)

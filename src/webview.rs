@@ -629,6 +629,7 @@ fn load_initial_values(settings: &Settings) -> InitialValues {
         anti_nickname_censorship: mod_json["antiNicknameCensorship"].as_bool().unwrap_or(true),
         emoji_switch: mod_json["emojiSwitch"].as_bool().unwrap_or(false),
         hint_switch: mod_json["hintSwitch"].as_bool().unwrap_or(true),
+        yiman_effect: mod_json["yimanEffect"].as_bool().unwrap_or(false),
         debug_log: settings.debug_log_on(),
         req_proxy: settings.req_proxy().to_owned(),
         github_prefix: settings.github_prefix().to_owned(),
@@ -671,6 +672,9 @@ fn live_mod_patch(change: SettingChange) -> Option<LiveModPatch> {
         }
         SettingChange::EmojiSwitch(value) => Some(LiveModPatch::EmojiSwitch(value)),
         SettingChange::HintSwitch(value) => Some(LiveModPatch::HintSwitch(value)),
+        // Persist in the running Modder too, so subsequent game edits cannot
+        // overwrite this setting before the user reloads the page.
+        SettingChange::YimanEffect(value) => Some(LiveModPatch::YimanEffect(value)),
         SettingChange::DebugLog(_) => None,
         _ => None,
     }
@@ -683,6 +687,7 @@ fn setting_applies_immediately(change: &SettingChange, mod_on: bool) -> bool {
         | SettingChange::UpdateCheckMode(_)
         | SettingChange::UpdateIntervalMinutes(_)
         | SettingChange::DebugLog(_) => true,
+        SettingChange::YimanEffect(_) => false,
         SettingChange::Nickname(_)
         | SettingChange::ShowServer(_)
         | SettingChange::AntiNicknameCensorship(_)
@@ -731,6 +736,9 @@ fn write_setting(config_dir: &Path, change: SettingChange) -> Result<()> {
             ("settings.mod.json", "emojiSwitch", Value::Bool(value))
         }
         SettingChange::HintSwitch(value) => ("settings.mod.json", "hintSwitch", Value::Bool(value)),
+        SettingChange::YimanEffect(value) => {
+            ("settings.mod.json", "yimanEffect", Value::Bool(value))
+        }
         SettingChange::DebugLog(value) => ("settings.json", "debugLog", Value::Bool(value)),
         SettingChange::ReqProxy(value) => ("settings.json", "reqProxy", Value::String(value)),
         SettingChange::GithubPrefix(value) => {

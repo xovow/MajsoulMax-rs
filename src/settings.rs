@@ -155,6 +155,7 @@ pub enum LiveModPatch {
     AntiNicknameCensorship(bool),
     EmojiSwitch(bool),
     HintSwitch(bool),
+    YimanEffect(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -548,6 +549,7 @@ pub struct ModSettings {
     pub title: u32,
     pub loading_bg: Vec<u32>,
     emoji_switch: bool,
+    yiman_effect: bool,
     pub views_presets: [Vec<ViewSlot>; 10],
     pub preset_index: u32,
     show_server: bool,
@@ -571,6 +573,7 @@ impl Default for ModSettings {
             title: 0,
             loading_bg: Vec::new(),
             emoji_switch: false,
+            yiman_effect: false,
             views_presets: Default::default(),
             preset_index: 0,
             show_server: true,
@@ -661,6 +664,9 @@ impl ModSettings {
     pub fn emoji_on(&self) -> bool {
         self.emoji_switch
     }
+    pub fn yiman_effect_on(&self) -> bool {
+        self.yiman_effect
+    }
     pub fn show_server(&self) -> bool {
         self.show_server
     }
@@ -675,6 +681,7 @@ impl ModSettings {
             LiveModPatch::AntiNicknameCensorship(value) => self.anti_nickname_censorship = *value,
             LiveModPatch::EmojiSwitch(value) => self.emoji_switch = *value,
             LiveModPatch::HintSwitch(value) => self.hint_switch = *value,
+            LiveModPatch::YimanEffect(value) => self.yiman_effect = *value,
         }
     }
 

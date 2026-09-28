@@ -1,9 +1,10 @@
 use anyhow::Result;
 use bytes::Bytes;
+use http_body_util::BodyExt;
 use hudsucker::{
     Body, HttpContext, HttpHandler, RequestOrResponse, WebSocketContext, WebSocketHandler,
     futures::{Sink, SinkExt, Stream, StreamExt},
-    hyper::{Method, Request, Response, StatusCode, Uri},
+    hyper::{Method, Request, Response, StatusCode, Uri, header},
     hyper_util::client::legacy::Error as ClientError,
     tokio_tungstenite::tungstenite::{self, Message},
 };
@@ -21,6 +22,7 @@ use crate::{
 const RESOURCE_TARGET: &str = "majsoul_max_rs::resource";
 const HTTP_TARGET: &str = "majsoul_max_rs::http";
 const WEBSOCKET_TARGET: &str = "majsoul_max_rs::websocket";
+const YIMAN_JS: &str = include_str!("yiman.js");
 
 // 由协议描述生成，覆盖所有具有标准错误字段的 RPC 响应。
 include!(concat!(env!("OUT_DIR"), "/error_response_methods.rs"));
@@ -36,6 +38,7 @@ pub struct Handler {
 #[derive(Clone)]
 struct HttpRequestInfo {
     diagnostic: Option<HttpDiagnostic>,
+    inject_yiman: bool,
 }
 
 #[derive(Clone)]
@@ -314,10 +317,21 @@ impl HttpHandler for Handler {
     async fn handle_request(
         &mut self,
         _ctx: &HttpContext,
-        req: Request<Body>,
+        mut req: Request<Body>,
     ) -> RequestOrResponse {
         // CONNECT 只建立隧道，里面的每个请求会再单独经过这里。
         if req.method() != Method::CONNECT {
+            let inject_yiman = if is_yiman_page(req.method(), req.uri()) {
+                match self.modder.as_ref() {
+                    Some(modder) => modder.yiman_effect_on().await,
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if inject_yiman {
+                prepare_yiman_request(&mut req);
+            }
             self.http_request = Some(HttpRequestInfo {
                 diagnostic: tracing::enabled!(target: HTTP_TARGET, tracing::Level::ERROR).then(
                     || HttpDiagnostic {
@@ -326,6 +340,7 @@ impl HttpHandler for Handler {
                         started: Instant::now(),
                     },
                 ),
+                inject_yiman,
             });
         }
         req.into()
@@ -336,10 +351,19 @@ impl HttpHandler for Handler {
         _ctx: &HttpContext,
         res: Response<Body>,
     ) -> impl Future<Output = Response<Body>> + Send {
-        if let Some(request) = self.http_request.take() {
+        let inject_yiman = if let Some(request) = self.http_request.take() {
             request.log_response(res.status());
+            request.inject_yiman
+        } else {
+            false
+        };
+        async move {
+            if inject_yiman {
+                inject_yiman_response(res).await
+            } else {
+                res
+            }
         }
-        async move { res }
     }
 
     /// Keep hudsucker's default 502 response, but record why forwarding failed.
@@ -457,4 +481,84 @@ fn log_websocket_error(
             "WebSocket 失败，断开连接"
         );
     }
+}
+
+fn is_yiman_page(method: &Method, uri: &Uri) -> bool {
+    method == Method::GET
+        && uri.host() == Some("game.maj-soul.com")
+        && matches!(uri.path(), "/1/" | "/1/index.html")
+}
+
+fn prepare_yiman_request(req: &mut Request<Body>) {
+    let headers = req.headers_mut();
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        header::HeaderValue::from_static("identity"),
+    );
+    for name in [
+        header::IF_NONE_MATCH,
+        header::IF_MODIFIED_SINCE,
+        header::IF_RANGE,
+        header::RANGE,
+    ] {
+        headers.remove(name);
+    }
+}
+
+fn inject_yiman_html(html: &str) -> Option<String> {
+    if html.contains("data-majsoulmax-yiman") || !html.contains("createUnityInstance") {
+        return None;
+    }
+    let at = html.to_ascii_lowercase().find("</head>")?;
+    Some(format!(
+        "{}<script data-majsoulmax-yiman=\"1\">\n{YIMAN_JS}\n</script>\n{}",
+        &html[..at],
+        &html[at..],
+    ))
+}
+
+async fn inject_yiman_response(res: Response<Body>) -> Response<Body> {
+    let value = |name| res.headers().get(name).and_then(|v| v.to_str().ok());
+    let html = value(header::CONTENT_TYPE).is_some_and(|v| {
+        v.split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("text/html")
+    });
+    if res.status() != StatusCode::OK
+        || !html
+        || !value(header::CONTENT_ENCODING)
+            .unwrap_or("identity")
+            .eq_ignore_ascii_case("identity")
+    {
+        return res;
+    }
+    let (mut parts, body) = res.into_parts();
+    let bytes = match body.collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(error) => {
+            tracing::warn!(target: HTTP_TARGET, "读取游戏页面失败：{error}");
+            let mut res = Response::new(Body::empty());
+            *res.status_mut() = StatusCode::BAD_GATEWAY;
+            return res;
+        }
+    };
+    let Some(html) = std::str::from_utf8(&bytes).ok().and_then(inject_yiman_html) else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    // The modified document must not reuse the upstream entity's cache metadata.
+    for name in ["transfer-encoding", "etag", "last-modified", "content-md5"] {
+        parts.headers.remove(name);
+    }
+    parts.headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    parts.headers.insert(
+        header::CONTENT_LENGTH,
+        header::HeaderValue::from_str(&html.len().to_string()).expect("decimal content length"),
+    );
+    tracing::debug!(target: HTTP_TARGET, "已注入役满动画脚本");
+    Response::from_parts(parts, Body::from(html))
 }

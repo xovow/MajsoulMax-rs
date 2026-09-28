@@ -1075,6 +1075,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "const_format",
+ "http-body-util",
  "hudsucker",
  "prost",
  "prost-build",
