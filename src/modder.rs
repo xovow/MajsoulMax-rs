@@ -357,7 +357,6 @@ impl Modder {
             target: RESOURCE_TARGET,
             characters = info.characters.len(),
             skins = info.skins.len(),
-            emoji_on = mod_settings.emoji_on(),
             "角色与装扮已解锁"
         );
         Ok(())
@@ -462,10 +461,9 @@ impl Modder {
                 }
                 tracing::debug!(
                     target: RESOURCE_TARGET,
-                    "本人形象：角色 {} 皮肤 {} 额外表情 {} 个；对局装扮 [{}]；角色装扮 [{}]",
+                    "本人形象：角色 {} 皮肤 {}；对局装扮 [{}]；角色装扮 [{}]",
                     character.charid,
                     character.skin,
-                    character.extra_emoji.len(),
                     describe_views(&p.views),
                     describe_views(&character.views),
                 );
@@ -487,11 +485,6 @@ impl Modder {
             ..Default::default()
         };
         character.rewarded_level.extend([1, 2, 3, 4, 5]);
-        if mod_settings.emoji_on()
-            && let Some(emojis) = self.max_data.emoji.get(&id)
-        {
-            character.extra_emoji.extend_from_slice(emojis);
-        }
         character
             .views
             .extend_from_slice(mod_settings.current_preset());

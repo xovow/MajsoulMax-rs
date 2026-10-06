@@ -627,7 +627,6 @@ fn load_initial_values(settings: &Settings) -> InitialValues {
         nickname: mod_json["nickname"].as_str().unwrap_or_default().to_owned(),
         show_server: mod_json["showServer"].as_bool().unwrap_or(true),
         anti_nickname_censorship: mod_json["antiNicknameCensorship"].as_bool().unwrap_or(true),
-        emoji_switch: mod_json["emojiSwitch"].as_bool().unwrap_or(false),
         hint_switch: mod_json["hintSwitch"].as_bool().unwrap_or(true),
         yiman_effect: mod_json["yimanEffect"].as_bool().unwrap_or(false),
         debug_log: settings.debug_log_on(),
@@ -670,7 +669,6 @@ fn live_mod_patch(change: SettingChange) -> Option<LiveModPatch> {
         SettingChange::AntiNicknameCensorship(value) => {
             Some(LiveModPatch::AntiNicknameCensorship(value))
         }
-        SettingChange::EmojiSwitch(value) => Some(LiveModPatch::EmojiSwitch(value)),
         SettingChange::HintSwitch(value) => Some(LiveModPatch::HintSwitch(value)),
         // Persist in the running Modder too, so subsequent game edits cannot
         // overwrite this setting before the user reloads the page.
@@ -691,7 +689,6 @@ fn setting_applies_immediately(change: &SettingChange, mod_on: bool) -> bool {
         SettingChange::Nickname(_)
         | SettingChange::ShowServer(_)
         | SettingChange::AntiNicknameCensorship(_)
-        | SettingChange::EmojiSwitch(_)
         | SettingChange::HintSwitch(_) => mod_on,
         _ => false,
     }
@@ -732,9 +729,6 @@ fn write_setting(config_dir: &Path, change: SettingChange) -> Result<()> {
             "antiNicknameCensorship",
             Value::Bool(value),
         ),
-        SettingChange::EmojiSwitch(value) => {
-            ("settings.mod.json", "emojiSwitch", Value::Bool(value))
-        }
         SettingChange::HintSwitch(value) => ("settings.mod.json", "hintSwitch", Value::Bool(value)),
         SettingChange::YimanEffect(value) => {
             ("settings.mod.json", "yimanEffect", Value::Bool(value))

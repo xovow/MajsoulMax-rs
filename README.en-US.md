@@ -66,7 +66,6 @@ To toggle Mod, edit `modSwitch` in `./liqi_config/settings.json`.
 -   Unlock yakuman animations in the web client
 -   Unlock all titles
 -   Unlock all loading CGs
--   Unlock all emojis (not recommended)
 -   Force-enable convenient hints
     -   Due to Mahjong Soul's own code restrictions, the Throne Room cannot normally enable convenient hints, so **after enabling this feature, entering Throne Room games will change the top-left corner to “Jade Room”**. This is not a bug!
 -   Favorite/star characters

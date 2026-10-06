@@ -53,7 +53,6 @@ const ID_RESTART: i32 = 1006;
 const ID_REFRESH: i32 = 1021;
 const ID_COLLAPSE: i32 = 1007;
 const ID_ANTI_NICKNAME_CENSORSHIP: i32 = 1008;
-const ID_EMOJI_SWITCH: i32 = 1009;
 const ID_REQ_PROXY: i32 = 1010;
 const ID_GITHUB_PREFIX: i32 = 1011;
 const ID_SCROLLBAR: i32 = 1012;
@@ -78,20 +77,18 @@ const CHILD_WHEEL_SUBCLASS_ID: usize = 3;
 const SIDEBAR_CLASS: &str = "MajsoulMaxSidebar";
 static SIDEBAR_CLASS_NAME: OnceLock<Vec<u16>> = OnceLock::new();
 
-const TOGGLE_IDS: [i32; 7] = [
+const TOGGLE_IDS: [i32; 6] = [
     ID_MOD_SWITCH,
     ID_SHOW_SERVER,
     ID_ANTI_NICKNAME_CENSORSHIP,
-    ID_EMOJI_SWITCH,
     ID_HINT_SWITCH,
     ID_YIMAN_EFFECT,
     ID_DEBUG_LOG,
 ];
-const TOGGLE_CHANGES: [fn(bool) -> SettingChange; 7] = [
+const TOGGLE_CHANGES: [fn(bool) -> SettingChange; 6] = [
     SettingChange::ModSwitch,
     SettingChange::ShowServer,
     SettingChange::AntiNicknameCensorship,
-    SettingChange::EmojiSwitch,
     SettingChange::HintSwitch,
     SettingChange::YimanEffect,
     SettingChange::DebugLog,
@@ -113,7 +110,7 @@ const UPDATE_MODES: [(UpdateCheckMode, &str); 3] = [
     (UpdateCheckMode::Periodic, "定时检查更新"),
     (UpdateCheckMode::Disabled, "关闭检查更新"),
 ];
-const RELOAD_LOCK_IDS: [i32; 15] = [
+const RELOAD_LOCK_IDS: [i32; 14] = [
     ID_MOD_SWITCH,
     ID_UPDATE_MODE,
     ID_UPDATE_INTERVAL,
@@ -122,7 +119,6 @@ const RELOAD_LOCK_IDS: [i32; 15] = [
     ID_NICKNAME,
     ID_SHOW_SERVER,
     ID_ANTI_NICKNAME_CENSORSHIP,
-    ID_EMOJI_SWITCH,
     ID_HINT_SWITCH,
     ID_YIMAN_EFFECT,
     ID_DEBUG_LOG,
@@ -139,7 +135,6 @@ pub enum SettingChange {
     Nickname(String),
     ShowServer(bool),
     AntiNicknameCensorship(bool),
-    EmojiSwitch(bool),
     HintSwitch(bool),
     YimanEffect(bool),
     DebugLog(bool),
@@ -172,7 +167,6 @@ pub struct InitialValues {
     pub nickname: String,
     pub show_server: bool,
     pub anti_nickname_censorship: bool,
-    pub emoji_switch: bool,
     pub hint_switch: bool,
     pub yiman_effect: bool,
     pub debug_log: bool,
@@ -364,7 +358,6 @@ impl NativeSidebar {
         content.add_field(ID_NICKNAME, "本地昵称", &initial.nickname, 64, 0)?;
         content.add_toggle(ID_SHOW_SERVER, "服务器名称", 12)?;
         content.add_toggle(ID_ANTI_NICKNAME_CENSORSHIP, "反昵称审查", 12)?;
-        content.add_toggle(ID_EMOJI_SWITCH, "额外表情", 12)?;
         content.add_toggle(ID_HINT_SWITCH, "王座便捷提示", 12)?;
         content.add_toggle(ID_YIMAN_EFFECT, "网页役满动画", 12)?;
         content.add_toggle(ID_DEBUG_LOG, "调试日志", 20)?;
@@ -1168,7 +1161,6 @@ fn toggle_values(values: &InitialValues) -> [bool; TOGGLE_IDS.len()] {
         values.mod_switch,
         values.show_server,
         values.anti_nickname_censorship,
-        values.emoji_switch,
         values.hint_switch,
         values.yiman_effect,
         values.debug_log,
